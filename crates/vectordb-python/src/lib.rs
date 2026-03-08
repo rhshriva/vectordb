@@ -158,6 +158,27 @@ impl PyFlatIndex {
         metric_to_str(self.inner.config().metric)
     }
 
+    /// Save the index to a file.
+    ///
+    /// Args:
+    ///     path (str): Destination file path (e.g. ``"index.json"``).
+    fn save(&self, path: &str) -> PyResult<()> {
+        self.inner.save(path).map_err(vec_err_to_py)
+    }
+
+    /// Load an index from a file previously written by :meth:`save`.
+    ///
+    /// Args:
+    ///     path (str): Path to the saved index file.
+    ///
+    /// Returns:
+    ///     FlatIndex: The restored index.
+    #[staticmethod]
+    fn load(path: &str) -> PyResult<Self> {
+        let inner = FlatIndex::load(path).map_err(vec_err_to_py)?;
+        Ok(Self { inner })
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "FlatIndex(dimensions={}, metric=\"{}\", len={})",
@@ -288,6 +309,32 @@ impl PyHnswIndex {
     #[getter]
     fn metric(&self) -> &'static str {
         metric_to_str(self.inner.config().metric)
+    }
+
+    /// Save the index to a file.
+    ///
+    /// Vectors are persisted; the HNSW graph is rebuilt automatically on load.
+    ///
+    /// Args:
+    ///     path (str): Destination file path (e.g. ``"index.json"``).
+    fn save(&self, path: &str) -> PyResult<()> {
+        self.inner.save(path).map_err(vec_err_to_py)
+    }
+
+    /// Load an index from a file previously written by :meth:`save`.
+    ///
+    /// The HNSW graph is rebuilt immediately, so the returned index is ready
+    /// for ANN search with no extra :meth:`flush` call needed.
+    ///
+    /// Args:
+    ///     path (str): Path to the saved index file.
+    ///
+    /// Returns:
+    ///     HnswIndex: The restored index.
+    #[staticmethod]
+    fn load(path: &str) -> PyResult<Self> {
+        let inner = HnswIndex::load(path).map_err(vec_err_to_py)?;
+        Ok(Self { inner })
     }
 
     fn __repr__(&self) -> String {

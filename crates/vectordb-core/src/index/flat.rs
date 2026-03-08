@@ -8,12 +8,20 @@
 /// - Ground-truth / recall evaluation of approximate indexes
 /// - Unit-testing pipelines without ANN noise
 use std::collections::HashMap;
+use std::io::{BufReader, BufWriter};
 
 use crate::{
     distance::Metric,
     error::VectorDbError,
     index::{IndexConfig, SearchResult, VectorIndex},
 };
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct FlatIndexSnapshot {
+    dimensions: usize,
+    metric: Metric,
+    vectors: HashMap<u64, Vec<f32>>,
+}
 
 pub struct FlatIndex {
     config: IndexConfig,
@@ -27,6 +35,33 @@ impl FlatIndex {
             config: IndexConfig { dimensions, metric },
             vectors: HashMap::new(),
         }
+    }
+
+    /// Save the index to a JSON file at `path`.
+    pub fn save(&self, path: &str) -> Result<(), VectorDbError> {
+        let file = std::fs::File::create(path)?;
+        let writer = BufWriter::new(file);
+        let snapshot = FlatIndexSnapshot {
+            dimensions: self.config.dimensions,
+            metric: self.config.metric,
+            vectors: self.vectors.clone(),
+        };
+        serde_json::to_writer(writer, &snapshot)?;
+        Ok(())
+    }
+
+    /// Load an index from a JSON file previously written by [`save`].
+    pub fn load(path: &str) -> Result<Self, VectorDbError> {
+        let file = std::fs::File::open(path)?;
+        let reader = BufReader::new(file);
+        let snapshot: FlatIndexSnapshot = serde_json::from_reader(reader)?;
+        Ok(Self {
+            config: IndexConfig {
+                dimensions: snapshot.dimensions,
+                metric: snapshot.metric,
+            },
+            vectors: snapshot.vectors,
+        })
     }
 
     /// Pre-allocate capacity for `n` vectors.
@@ -171,6 +206,21 @@ mod tests {
         assert!(idx.delete(1));
         assert_eq!(idx.len(), 3);
         assert!(!idx.delete(99)); // non-existent
+    }
+
+    #[test]
+    fn save_and_load_round_trip() {
+        let idx = make_index();
+        let path = "/tmp/flat_index_test.json";
+        idx.save(path).unwrap();
+        let loaded = FlatIndex::load(path).unwrap();
+        assert_eq!(loaded.len(), idx.len());
+        assert_eq!(loaded.config().dimensions, idx.config().dimensions);
+        assert_eq!(loaded.config().metric, idx.config().metric);
+        // Search results must match
+        let orig = idx.search(&[1.0, 0.0, 0.0], 1).unwrap();
+        let from_disk = loaded.search(&[1.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(orig[0].id, from_disk[0].id);
     }
 
     #[test]

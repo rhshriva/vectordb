@@ -14,12 +14,22 @@
 /// - FlatIndex: 100% recall, O(N·D) query, trivial updates
 /// - HnswIndex: ~95–99% recall (tunable), O(log N · ef) query, no single-delete support
 use std::collections::HashMap;
+use std::io::{BufReader, BufWriter};
 
 use crate::{
     distance::Metric,
     error::VectorDbError,
     index::{IndexConfig, SearchResult, VectorIndex},
 };
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct HnswIndexSnapshot {
+    dimensions: usize,
+    metric: Metric,
+    hnsw_config: HnswConfig,
+    flush_threshold: usize,
+    vectors: HashMap<u64, Vec<f32>>,
+}
 
 /// Parameters for building and querying the HNSW graph.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -129,6 +139,47 @@ impl HnswIndex {
 
         let hnsw = builder.build(points, values);
         self.built = Some(BuiltHnsw { hnsw });
+    }
+
+    /// Save the index to a JSON file at `path`.
+    ///
+    /// The HNSW graph itself is not persisted — it is rebuilt from the stored
+    /// vectors when [`load`] calls [`flush`] after deserializing.
+    pub fn save(&self, path: &str) -> Result<(), VectorDbError> {
+        let file = std::fs::File::create(path)?;
+        let writer = BufWriter::new(file);
+        let snapshot = HnswIndexSnapshot {
+            dimensions: self.config.dimensions,
+            metric: self.config.metric,
+            hnsw_config: self.hnsw_config.clone(),
+            flush_threshold: self.flush_threshold,
+            vectors: self.all_vectors.clone(),
+        };
+        serde_json::to_writer(writer, &snapshot)?;
+        Ok(())
+    }
+
+    /// Load an index from a JSON file previously written by [`save`].
+    ///
+    /// The HNSW graph is rebuilt immediately via [`flush`], so the returned
+    /// index is ready for ANN search.
+    pub fn load(path: &str) -> Result<Self, VectorDbError> {
+        let file = std::fs::File::open(path)?;
+        let reader = BufReader::new(file);
+        let snapshot: HnswIndexSnapshot = serde_json::from_reader(reader)?;
+        let mut index = Self {
+            config: IndexConfig {
+                dimensions: snapshot.dimensions,
+                metric: snapshot.metric,
+            },
+            hnsw_config: snapshot.hnsw_config,
+            staging: Vec::new(),
+            all_vectors: snapshot.vectors,
+            flush_threshold: snapshot.flush_threshold,
+            built: None,
+        };
+        index.flush();
+        Ok(index)
     }
 
     /// Set the `ef_search` parameter at runtime (no rebuild needed).
@@ -310,6 +361,21 @@ mod tests {
         let mut idx = make_index();
         assert!(idx.delete(5));
         assert_eq!(idx.len(), 19);
+    }
+
+    #[test]
+    fn save_and_load_round_trip() {
+        let idx = make_index();
+        let path = "/tmp/hnsw_index_test.json";
+        idx.save(path).unwrap();
+        let loaded = HnswIndex::load(path).unwrap();
+        assert_eq!(loaded.len(), idx.len());
+        assert_eq!(loaded.config().dimensions, idx.config().dimensions);
+        assert_eq!(loaded.config().metric, idx.config().metric);
+        // Nearest neighbour must still be correct after load+rebuild
+        let orig = idx.search(&[5.0, 0.0, 0.0], 1).unwrap();
+        let from_disk = loaded.search(&[5.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(orig[0].id, from_disk[0].id);
     }
 
     #[test]
