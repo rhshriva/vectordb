@@ -14,6 +14,7 @@ A high-performance vector database @ Scale, written in Rust.
 - [CLI](#cli)
 - [Index Types](#index-types)
 - [Distance Metrics](#distance-metrics)
+- [Building on macOS](#building-on-macos)
 
 ---
 
@@ -250,6 +251,152 @@ VDB_HOST=http://my-server:8080 vdb list
 | `l2` | `‖a − b‖₂` | Absolute position matters (coordinates, pixel embeddings) |
 | `cosine` | `1 − (a·b) / (‖a‖ ‖b‖)` | Direction matters, magnitude doesn't (NLP embeddings) |
 | `dot_product` | `−(a · b)` | Pre-normalised vectors, max-inner-product search |
+
+---
+
+## Building on macOS
+
+This section covers macOS-specific setup and known issues developers encounter
+when building the project on Apple hardware (both Intel and Apple Silicon).
+
+### Prerequisites
+
+```bash
+# Install Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source ~/.cargo/env
+
+# Install Python 3.8+ (Homebrew recommended)
+brew install python
+
+# Install maturin (required for the Python bindings crate)
+pip install maturin
+```
+
+### Building the Rust workspace
+
+```bash
+cargo build --release
+```
+
+### Building the Python bindings
+
+The `vectordb-python` crate is a PyO3 extension module and **must be built
+with `maturin`**, not plain `cargo build`:
+
+```bash
+# Dev install into your active virtual environment (fast iteration)
+maturin develop
+
+# Build a release wheel
+maturin build --release
+pip install target/wheels/vectordb-*.whl
+```
+
+### Apple Silicon (M1/M2/M3) — universal wheel
+
+```bash
+rustup target add x86_64-apple-darwin aarch64-apple-darwin
+maturin build --release --target universal2-apple-darwin
+```
+
+---
+
+### Known issues
+
+#### 1. `cargo build` fails with "Undefined symbols for architecture arm64"
+
+**Symptom:**
+
+```
+Undefined symbols for architecture arm64:
+  "_PyBaseObject_Type", referenced from: ...
+  "_PyBytes_AsString", referenced from: ...
+  ...
+ld: symbol(s) not found for architecture arm64
+```
+
+**Cause:** PyO3 extension modules intentionally leave Python symbols
+(`_Py*`) unresolved at link time. They are resolved at runtime when
+Python loads the `.so`. Plain `cargo build` does not pass the required
+`-undefined dynamic_lookup` linker flag, so the link step fails.
+
+**Fix:** The repository ships a `.cargo/config.toml` that adds this
+flag automatically for both `aarch64-apple-darwin` and
+`x86_64-apple-darwin` targets. If you still see the error, ensure the
+file is present:
+
+```toml
+# .cargo/config.toml
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
+```
+
+> For building the Python extension the correct tool is always
+> `maturin develop` — it sets this flag automatically regardless of
+> `.cargo/config.toml`.
+
+---
+
+#### 2. Python not found / wrong Python picked up
+
+**Symptom:** PyO3's build script prints `error: Python version X.Y is
+not supported` or links against the wrong interpreter.
+
+**Fix:** Point PyO3 at your chosen Python explicitly:
+
+```bash
+export PYO3_PYTHON=$(which python3)
+maturin develop
+```
+
+---
+
+#### 3. pyenv Python missing shared library
+
+**Symptom:** Linker error referencing `libpythonX.Y.dylib` not found,
+or PyO3 build script warning `could not find Python shared library`.
+
+**Cause:** pyenv builds Python without a shared library by default.
+
+**Fix:** Reinstall Python with shared-library support enabled:
+
+```bash
+PYTHON_CONFIGURE_OPTS="--enable-shared" pyenv install 3.11.9
+pyenv global 3.11.9
+```
+
+---
+
+#### 4. `zsh: unknown sort specifier` when running Python commands
+
+**Symptom:** zsh prints `zsh: unknown sort specifier` after certain
+`python3 -c` invocations.
+
+**Cause:** This is a zsh glob-expansion side effect when the Python
+output contains characters zsh tries to interpret. It does not affect
+the build — wrap the command in quotes or run it inside a subshell to
+suppress it.
+
+---
+
+#### 5. Build fails after Xcode / Command Line Tools update
+
+**Symptom:** After updating macOS or Xcode, `cargo build` or `maturin`
+fails with linker errors unrelated to Python.
+
+**Fix:** Reinstall the Command Line Tools:
+
+```bash
+sudo xcode-select --reset
+xcode-select --install
+```
+
+Then re-run `rustup show` to confirm the active toolchain is still
+targeting `aarch64-apple-darwin` or `x86_64-apple-darwin` as expected.
 
 ---
 
