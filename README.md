@@ -14,6 +14,7 @@ A high-performance vector database @ Scale, written in Rust.
 - [CLI](#cli)
 - [Index Types](#index-types)
 - [Distance Metrics](#distance-metrics)
+- [Development Setup](#development-setup)
 - [Building on macOS](#building-on-macos)
 
 ---
@@ -134,6 +135,72 @@ Binaries land in `target/release/`:
 ```
 
 Set `RUST_LOG=debug` for verbose output.
+
+---
+
+## Development Setup
+
+### 1. Prerequisites
+
+```bash
+# Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source ~/.cargo/env
+
+# Python 3.8+ and maturin (only needed for Python bindings)
+brew install python          # macOS; use apt/dnf on Linux
+pip install maturin
+```
+
+### 2. Clone and branch
+
+```bash
+git clone https://github.com/vectordb/vectordb.git
+cd vectordb
+git checkout -b feat/my-change origin/main   # or an existing branch
+```
+
+### 3. Python virtual environment
+
+Skip if you only need the Rust server/CLI.
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install maturin
+```
+
+### 4. Build
+
+```bash
+# Rust (server + CLI)
+cargo build
+
+# Python bindings (venv must be active)
+maturin develop
+python3 -c "import vectordb; print('OK')"   # verify
+```
+
+> **macOS:** if `cargo build` fails with undefined Python symbols, see
+> [Building on macOS](#building-on-macos).
+
+### 5. Test and run
+
+```bash
+cargo test                                   # run all tests
+RUST_LOG=debug cargo run -p vectordb-server  # start dev server
+./target/debug/vdb list                      # use the CLI
+```
+
+### Project structure
+
+```
+crates/
+├── vectordb-core/     # index trait, FlatIndex, HnswIndex
+├── vectordb-server/   # Axum HTTP server
+├── vectordb-cli/      # vdb CLI binary
+└── vectordb-python/   # PyO3 Python bindings
+```
 
 ---
 
