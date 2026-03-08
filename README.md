@@ -255,4 +255,4 @@ VDB_HOST=http://my-server:8080 vdb list
 
 ## License
 
-MIT
+Apache 2.0
