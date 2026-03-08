@@ -1,0 +1,57 @@
+pub mod flat;
+pub mod hnsw;
+
+use crate::{distance::Metric, error::VectorDbError};
+use serde::{Deserialize, Serialize};
+
+/// A single search result.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchResult {
+    /// Caller-supplied ID for the vector.
+    pub id: u64,
+    /// Distance from the query vector (lower = more similar).
+    pub distance: f32,
+}
+
+/// Configuration shared by all index types.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexConfig {
+    /// Number of dimensions every vector must have.
+    pub dimensions: usize,
+    /// Distance metric used by this index.
+    pub metric: Metric,
+}
+
+/// The unified interface every index implementation must satisfy.
+///
+/// All methods are synchronous; callers that need async should wrap
+/// the index in a `tokio::task::spawn_blocking` call.
+pub trait VectorIndex: Send + Sync {
+    /// Add a single vector with the given ID.
+    /// Returns an error if the vector has the wrong dimension or the ID already exists.
+    fn add(&mut self, id: u64, vector: &[f32]) -> Result<(), VectorDbError>;
+
+    /// Add multiple vectors in one call (may be more efficient for batch builds).
+    fn add_batch(&mut self, entries: &[(u64, Vec<f32>)]) -> Result<(), VectorDbError> {
+        for (id, vec) in entries {
+            self.add(*id, vec)?;
+        }
+        Ok(())
+    }
+
+    /// Search for the `k` nearest neighbours of `query`.
+    fn search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>, VectorDbError>;
+
+    /// Remove a vector by ID. Returns `true` if found and removed, `false` if not found.
+    fn delete(&mut self, id: u64) -> bool;
+
+    /// Number of vectors currently stored.
+    fn len(&self) -> usize;
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Index configuration (dimensions, metric).
+    fn config(&self) -> &IndexConfig;
+}

@@ -1,0 +1,22 @@
+[package]
+name = "vectordb-server"
+version.workspace = true
+edition.workspace = true
+description = "HTTP/JSON server for vectordb"
+
+[[bin]]
+name = "vectordb-server"
+path = "src/main.rs"
+
+[dependencies]
+vectordb-core = { path = "../vectordb-core" }
+tokio = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }

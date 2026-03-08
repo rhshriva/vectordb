@@ -1,0 +1,17 @@
+[package]
+name = "vectordb-core"
+version.workspace = true
+edition.workspace = true
+description = "Core vector database engine — indexes, distance metrics, storage"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+rand = { workspace = true }
+instant-distance = { workspace = true }
+
+[dev-dependencies]
+approx = "0.5"

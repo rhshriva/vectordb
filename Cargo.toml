@@ -1,0 +1,60 @@
+[workspace]
+members = [
+    "crates/vectordb-core",
+    "crates/vectordb-server",
+    "crates/vectordb-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["vectordb contributors"]
+license = "MIT"
+repository = "https://github.com/vectordb/vectordb"
+
+[workspace.dependencies]
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# ANN / HNSW
+instant-distance = "0.6"
+
+# SIMD-accelerated distance (optional feature)
+# simsimd = "3"
+
+# HTTP server
+axum = { version = "0.7", features = ["json"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["trace", "cors"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# UUID
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Random
+rand = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+opt-level = 3
+debug = true
