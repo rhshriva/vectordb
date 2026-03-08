@@ -332,30 +332,112 @@ All requests and responses use `application/json`.
 
 ## CLI
 
+`vdb` is the command-line client for a running `vectordb-server`.
+
+### Build and install
+
 ```bash
-# List collections
+cargo build --release
+# binary lands at target/release/vdb
+```
+
+Add `target/release` to your `$PATH`, or run it as `./target/release/vdb`.
+
+### Server URL
+
+By default `vdb` connects to `http://localhost:8080`. Override with `--host` or the `VDB_HOST` environment variable:
+
+```bash
+vdb --host http://prod-server:8080 list
+VDB_HOST=http://prod-server:8080 vdb list
+```
+
+### Commands
+
+#### `vdb list`
+List all collections.
+```bash
 vdb list
+```
 
-# Create a 768-dimensional cosine collection backed by HNSW
+#### `vdb create <name>`
+Create a new collection.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--dimensions <N>` | *(required)* | Number of dimensions |
+| `--metric <m>` | `cosine` | `l2` \| `cosine` \| `dot_product` |
+| `--index <type>` | `hnsw` | `flat` \| `hnsw` |
+
+```bash
+vdb create my-docs --dimensions 768
 vdb create my-docs --dimensions 768 --metric cosine --index hnsw
+vdb create exact-idx --dimensions 128 --metric l2 --index flat
+```
 
-# Insert a vector
-vdb insert my-docs --id 1 --vector "0.1,0.2,0.3,..."
+#### `vdb insert <collection>`
+Insert or update a vector (comma-separated floats).
 
-# Search for top-5 neighbours
-vdb search my-docs --vector "0.1,0.2,0.3,..." --k 5
+```bash
+vdb insert my-docs --id 1 --vector "0.1,0.2,0.3"
+vdb insert my-docs --id 42 --vector "0.9,0.1,0.5,0.3"
+```
 
-# Delete a vector
-vdb delete my-docs --id 1
+#### `vdb search <collection>`
+Search for nearest neighbours. Prints JSON results.
 
-# Delete a collection
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--vector <floats>` | *(required)* | Comma-separated query vector |
+| `--k <N>` | `5` | Number of neighbours to return |
+
+```bash
+vdb search my-docs --vector "0.1,0.2,0.3"
+vdb search my-docs --vector "0.1,0.2,0.3" --k 10
+```
+
+Output:
+```json
+{
+  "results": [
+    { "id": 1,  "distance": 0.0 },
+    { "id": 99, "distance": 0.042 }
+  ]
+}
+```
+
+#### `vdb delete <collection>`
+Delete a single vector by ID.
+```bash
+vdb delete my-docs --id 42
+```
+
+#### `vdb drop <collection>`
+Delete an entire collection.
+```bash
 vdb drop my-docs
 ```
 
-Override the server URL with `--host` or the `VDB_HOST` environment variable:
+### End-to-end example
 
 ```bash
-VDB_HOST=http://my-server:8080 vdb list
+# Start the server
+./target/release/vectordb-server &
+
+# Create a 3-dimensional collection
+vdb create colours --dimensions 3 --metric l2 --index flat
+
+# Insert some vectors
+vdb insert colours --id 1 --vector "1.0,0.0,0.0"   # red
+vdb insert colours --id 2 --vector "0.0,1.0,0.0"   # green
+vdb insert colours --id 3 --vector "0.0,0.0,1.0"   # blue
+
+# Search for the 2 closest to "mostly red"
+vdb search colours --vector "0.9,0.1,0.0" --k 2
+
+# Remove a vector and the collection
+vdb delete colours --id 3
+vdb drop colours
 ```
 
 ---
