@@ -113,6 +113,9 @@ impl VectorIndex for FlatIndex {
 
         // Partial sort: only need the top-k smallest distances.
         let k = k.min(distances.len());
+        if k == 0 {
+            return Ok(vec![]);
+        }
         distances.select_nth_unstable_by(k - 1, |a, b| {
             a.distance.partial_cmp(&b.distance).unwrap_or(std::cmp::Ordering::Equal)
         });
@@ -231,5 +234,84 @@ mod tests {
         idx.add(3, &[1.0, 1.0]).unwrap();
         let results = idx.search(&[1.0, 0.0], 1).unwrap();
         assert_eq!(results[0].id, 1); // exact match has cosine distance ≈ 0
+    }
+
+    #[test]
+    fn dot_product_metric() {
+        let mut idx = FlatIndex::new(2, Metric::DotProduct);
+        idx.add(1, &[1.0, 0.0]).unwrap();
+        idx.add(2, &[0.0, 1.0]).unwrap();
+        idx.add(3, &[3.0, 0.0]).unwrap(); // highest dot with [1,0]
+        let results = idx.search(&[1.0, 0.0], 1).unwrap();
+        assert_eq!(results[0].id, 3); // -dot(3,0) = -3, lowest = most similar
+    }
+
+    #[test]
+    fn empty_index_search_returns_empty() {
+        let idx = FlatIndex::new(3, Metric::L2);
+        let results = idx.search(&[1.0, 0.0, 0.0], 5).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn k_zero_returns_empty() {
+        let idx = make_index();
+        let results = idx.search(&[1.0, 0.0, 0.0], 0).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn single_vector_is_its_own_nearest() {
+        let mut idx = FlatIndex::new(2, Metric::L2);
+        idx.add(42, &[0.5, 0.5]).unwrap();
+        let results = idx.search(&[0.5, 0.5], 1).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, 42);
+    }
+
+    #[test]
+    fn add_batch_inserts_all() {
+        let mut idx = FlatIndex::new(2, Metric::L2);
+        let entries = vec![(1u64, vec![1.0_f32, 0.0]), (2, vec![0.0, 1.0]), (3, vec![1.0, 1.0])];
+        idx.add_batch(&entries).unwrap();
+        assert_eq!(idx.len(), 3);
+    }
+
+    #[test]
+    fn add_batch_stops_on_duplicate() {
+        let mut idx = FlatIndex::new(2, Metric::L2);
+        idx.add(1, &[1.0, 0.0]).unwrap();
+        let entries = vec![(2u64, vec![0.0_f32, 1.0]), (1, vec![0.5, 0.5])]; // ID 1 is duplicate
+        assert!(idx.add_batch(&entries).is_err());
+    }
+
+    #[test]
+    fn upsert_pattern_delete_then_readd() {
+        let mut idx = make_index();
+        assert!(idx.delete(1));
+        idx.add(1, &[9.0, 0.0, 0.0]).unwrap(); // re-add with new vector
+        let results = idx.search(&[9.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(results[0].id, 1);
+    }
+
+    #[test]
+    fn save_to_bad_path_returns_io_error() {
+        let idx = make_index();
+        let result = idx.save("/nonexistent/directory/index.json");
+        assert!(matches!(result, Err(VectorDbError::Io(_))));
+    }
+
+    #[test]
+    fn load_nonexistent_file_returns_io_error() {
+        let result = FlatIndex::load("/nonexistent/no_such_file.json");
+        assert!(matches!(result, Err(VectorDbError::Io(_))));
+    }
+
+    #[test]
+    fn load_malformed_json_returns_serialization_error() {
+        let path = "/tmp/flat_bad.json";
+        std::fs::write(path, b"not valid json").unwrap();
+        let result = FlatIndex::load(path);
+        assert!(matches!(result, Err(VectorDbError::Serialization(_))));
     }
 }

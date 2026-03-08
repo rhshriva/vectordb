@@ -388,4 +388,94 @@ mod tests {
         let r = idx.search(&[1.0, 0.0], 1).unwrap();
         assert_eq!(r[0].id, 1);
     }
+
+    #[test]
+    fn cosine_metric() {
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 20, m: 8 };
+        let mut idx = HnswIndex::new(2, Metric::Cosine, cfg);
+        for i in 1u64..=20 {
+            idx.add(i, &[i as f32, 0.0]).unwrap();
+        }
+        idx.flush();
+        // All vectors point in the same direction — cosine distance ≈ 0 for any of them
+        let r = idx.search(&[1.0, 0.0], 1).unwrap();
+        assert!(r[0].distance < 1e-4);
+    }
+
+    #[test]
+    fn dot_product_metric() {
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 20, m: 8 };
+        let mut idx = HnswIndex::new(2, Metric::DotProduct, cfg);
+        for i in 1u64..=20 {
+            idx.add(i, &[i as f32, 0.0]).unwrap();
+        }
+        idx.flush();
+        // Largest dot product with [1,0] → id=20 (vector [20,0], distance = -20)
+        let r = idx.search(&[1.0, 0.0], 1).unwrap();
+        assert_eq!(r[0].id, 20);
+    }
+
+    #[test]
+    fn empty_index_search_returns_empty() {
+        let idx = HnswIndex::new(3, Metric::L2, HnswConfig::default());
+        let r = idx.search(&[1.0, 0.0, 0.0], 5).unwrap();
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn k_zero_returns_empty() {
+        let idx = make_index();
+        let r = idx.search(&[1.0, 0.0, 0.0], 0).unwrap();
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn auto_flush_triggers_at_threshold() {
+        let cfg = HnswConfig::default();
+        let mut idx = HnswIndex::new(1, Metric::L2, cfg).with_flush_threshold(5);
+        for i in 0..5u64 {
+            idx.add(i, &[i as f32]).unwrap();
+        }
+        // After 5 inserts the graph should be built automatically
+        assert_eq!(idx.len(), 5);
+        let r = idx.search(&[2.0], 1).unwrap();
+        assert_eq!(r[0].id, 2);
+    }
+
+    #[test]
+    fn delete_then_flush_restores_search() {
+        let mut idx = make_index(); // 20 vectors, already flushed
+        assert!(idx.delete(10));
+        idx.flush();
+        let r = idx.search(&[10.0, 0.0, 0.0], 1).unwrap();
+        assert_ne!(r[0].id, 10); // deleted vector must not appear
+    }
+
+    #[test]
+    fn add_batch_then_explicit_flush() {
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 20, m: 8 };
+        let mut idx = HnswIndex::new(1, Metric::L2, cfg);
+        let entries: Vec<(u64, Vec<f32>)> = (0..50u64).map(|i| (i, vec![i as f32])).collect();
+        idx.add_batch(&entries).unwrap();
+        idx.flush();
+        assert_eq!(idx.len(), 50);
+        let r = idx.search(&[25.0], 1).unwrap();
+        assert_eq!(r[0].id, 25);
+    }
+
+    #[test]
+    fn save_with_staging_persists_all_vectors() {
+        // Insert fewer than flush_threshold so staging buffer is non-empty at save time.
+        let cfg = HnswConfig::default();
+        let mut idx = HnswIndex::new(1, Metric::L2, cfg).with_flush_threshold(1000);
+        for i in 0..10u64 {
+            idx.add(i, &[i as f32]).unwrap();
+        }
+        let path = "/tmp/hnsw_staging_test.json";
+        idx.save(path).unwrap();
+        let loaded = HnswIndex::load(path).unwrap();
+        assert_eq!(loaded.len(), 10);
+        let r = loaded.search(&[5.0], 1).unwrap();
+        assert_eq!(r[0].id, 5);
+    }
 }

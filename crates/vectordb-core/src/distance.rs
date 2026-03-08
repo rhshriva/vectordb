@@ -135,4 +135,43 @@ mod tests {
         assert_abs_diff_eq!(Metric::L2.distance(&a, &b), 2.0_f32.sqrt(), epsilon = 1e-5);
         assert_abs_diff_eq!(Metric::Cosine.distance(&a, &b), 1.0, epsilon = 1e-6);
     }
+
+    #[test]
+    fn dot_product_known_value() {
+        // dot([1,2],[3,4]) = 11 → distance = -11
+        let a = vec![1.0_f32, 2.0];
+        let b = vec![3.0_f32, 4.0];
+        assert_abs_diff_eq!(dot_product_distance(&a, &b), -11.0, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn dot_product_orthogonal_is_zero() {
+        let a = vec![1.0_f32, 0.0];
+        let b = vec![0.0_f32, 1.0];
+        assert_abs_diff_eq!(dot_product_distance(&a, &b), 0.0, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn dot_product_metric_dispatch() {
+        let a = vec![1.0_f32, 2.0];
+        let b = vec![3.0_f32, 4.0];
+        assert_abs_diff_eq!(Metric::DotProduct.distance(&a, &b), -11.0, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn cosine_zero_vector_is_maximally_dissimilar() {
+        // Zero vector returns 1.0, not NaN.
+        let zero = vec![0.0_f32, 0.0];
+        let unit = vec![1.0_f32, 0.0];
+        assert_abs_diff_eq!(cosine_distance(&zero, &unit), 1.0, epsilon = 1e-6);
+        assert_abs_diff_eq!(cosine_distance(&unit, &zero), 1.0, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn normalize_zero_vector_is_noop() {
+        // Normalising a zero vector must not panic or produce NaN.
+        let mut v = vec![0.0_f32, 0.0];
+        normalize(&mut v);
+        assert_eq!(v, vec![0.0, 0.0]);
+    }
 }
