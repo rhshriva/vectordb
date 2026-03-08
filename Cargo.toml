@@ -3,6 +3,7 @@ members = [
     "crates/vectordb-core",
     "crates/vectordb-server",
     "crates/vectordb-cli",
+    "crates/vectordb-python",
 ]
 resolver = "2"
 
@@ -48,6 +49,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 # Random
 rand = "0.8"
+
+# Python bindings
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"] }
 
 [profile.release]
 opt-level = 3

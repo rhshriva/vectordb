@@ -1,0 +1,13 @@
+[package]
+name = "vectordb-python"
+version.workspace = true
+edition.workspace = true
+description = "Python bindings for vectordb"
+
+[lib]
+name = "vectordb"
+crate-type = ["cdylib"]
+
+[dependencies]
+vectordb-core = { path = "../vectordb-core" }
+pyo3 = { workspace = true }
