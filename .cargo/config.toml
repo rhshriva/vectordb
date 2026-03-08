@@ -1,0 +1,8 @@
+# On macOS, PyO3 extension modules intentionally leave Python symbols unresolved
+# at link time — they are resolved at runtime when Python loads the .so.
+# This mirrors what maturin passes to the linker automatically.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
