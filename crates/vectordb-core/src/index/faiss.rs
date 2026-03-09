@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use faiss::{index_factory, Index, MetricType};
+use faiss::{index_factory, index::IndexImpl, Index, MetricType};
 use tracing::warn;
 
 use crate::{distance::Metric, error::VectorDbError};
@@ -33,7 +33,7 @@ use super::{IndexConfig, SearchResult, VectorIndex};
 
 struct FaissState {
     /// The live FAISS index; `None` when a rebuild is required.
-    index: Option<faiss::IndexImpl>,
+    index: Option<IndexImpl>,
     /// Maps FAISS internal 0-based offset → caller-supplied u64 ID.
     ///
     /// Position i in this Vec corresponds to the i-th vector stored in the
@@ -41,7 +41,7 @@ struct FaissState {
     id_map: Vec<u64>,
 }
 
-// Safety: `faiss::IndexImpl` wraps a C++ pointer (`faiss_Index_t *`).
+// Safety: `IndexImpl` wraps a C++ pointer (`faiss_Index_t *`).
 // Raw pointers are `!Send` by default in Rust.  FAISS indexes do not use
 // thread-local state; we guarantee exclusive access via the surrounding
 // `Mutex`, so moving the value to another thread is safe.
@@ -213,9 +213,10 @@ impl VectorIndex for FaissIndex {
         let results = labels
             .iter()
             .zip(distances.iter())
-            .filter(|(&label, _)| label >= 0)
+            .filter(|(&label, _)| label.is_some())
             .map(|(&label, &dist)| {
-                let id = guard.id_map[label as usize];
+                // label.get() returns Some(u64) because we filtered with is_some() above.
+                let id = guard.id_map[label.get().unwrap() as usize];
                 SearchResult {
                     id,
                     distance: convert_distance(dist, self.config.metric),
