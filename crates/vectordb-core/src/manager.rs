@@ -107,6 +107,9 @@ mod tests {
             index_type: IndexType::Flat,
             hnsw_config: None,
             wal_compact_threshold: 50_000,
+            auto_promote_threshold: None,
+            promotion_hnsw_config: None,
+            embedding_model: None,
         }
     }
 

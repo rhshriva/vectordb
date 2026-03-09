@@ -12,6 +12,7 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 rand = { workspace = true }
 instant-distance = { workspace = true }
+lru = { workspace = true }
 
 [dev-dependencies]
 approx = "0.5"

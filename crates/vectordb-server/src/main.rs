@@ -22,6 +22,7 @@ use vectordb_core::{
     payload::FilterCondition,
     VectorDbError,
 };
+use vectordb_embeddings::{EmbeddingProvider, OllamaProvider, OpenAiProvider};
 
 // ── Shared state ─────────────────────────────────────────────────────────────
 
@@ -40,6 +41,32 @@ struct CreateCollectionRequest {
     /// "flat" or "hnsw" (default: "hnsw")
     index_type: Option<String>,
     hnsw: Option<HnswConfig>,
+    /// Automatically promote from Flat to HNSW when vector count reaches this value.
+    #[serde(default)]
+    auto_promote_threshold: Option<usize>,
+    /// HNSW config to use for auto-promotion (optional; defaults to HnswConfig::default()).
+    #[serde(default)]
+    promotion_hnsw_config: Option<HnswConfig>,
+    /// Embedding model identifier, e.g. `"openai/text-embedding-3-small"` or
+    /// `"ollama/nomic-embed-text"`. Required for embed-upsert / embed-search endpoints.
+    #[serde(default)]
+    embedding_model: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct EmbedUpsertRequest {
+    id: u64,
+    text: String,
+    #[serde(default)]
+    payload: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct EmbedSearchRequest {
+    text: String,
+    k: usize,
+    #[serde(default)]
+    filter: Option<FilterCondition>,
 }
 
 #[derive(Deserialize)]
@@ -147,6 +174,9 @@ async fn create_collection(
         index_type,
         hnsw_config,
         wal_compact_threshold: 50_000,
+        auto_promote_threshold: req.auto_promote_threshold,
+        promotion_hnsw_config: req.promotion_hnsw_config.clone(),
+        embedding_model: req.embedding_model.clone(),
     };
 
     let mut mgr = state.manager.write().unwrap();
@@ -266,6 +296,139 @@ async fn delete_vector(
     }
 }
 
+// ── Embedding helpers ─────────────────────────────────────────────────────────
+
+/// Resolve a model identifier string to a live embedding provider.
+///
+/// Supported prefixes:
+/// - `"openai/<model>"` — uses `OPENAI_API_KEY` env var
+/// - `"ollama/<model>"` — uses `OLLAMA_BASE_URL` (default: `http://localhost:11434`)
+fn make_provider(model_id: &str) -> Result<Box<dyn EmbeddingProvider>, String> {
+    if let Some(model) = model_id.strip_prefix("openai/") {
+        let provider = OpenAiProvider::from_env(model)
+            .map_err(|e| e.to_string())?;
+        return Ok(Box::new(provider));
+    }
+    if let Some(model) = model_id.strip_prefix("ollama/") {
+        let base_url = std::env::var("OLLAMA_BASE_URL")
+            .unwrap_or_else(|_| "http://localhost:11434".to_string());
+        return Ok(Box::new(OllamaProvider::new(base_url, model)));
+    }
+    Err(format!(
+        "unknown model prefix in '{model_id}'; use 'openai/<model>' or 'ollama/<model>'"
+    ))
+}
+
+async fn embed_upsert(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+    Json(req): Json<EmbedUpsertRequest>,
+) -> impl IntoResponse {
+    // Get the model id without holding the lock
+    let model_id = {
+        let mgr = state.manager.read().unwrap();
+        match mgr.get_collection(&name) {
+            None => {
+                return err_response(
+                    StatusCode::NOT_FOUND,
+                    format!("collection '{name}' not found"),
+                )
+                .into_response()
+            }
+            Some(col) => match col.meta().embedding_model.clone() {
+                Some(m) => m,
+                None => {
+                    return err_response(
+                        StatusCode::BAD_REQUEST,
+                        format!("collection '{name}' has no embedding_model configured"),
+                    )
+                    .into_response()
+                }
+            },
+        }
+    };
+
+    let provider = match make_provider(&model_id) {
+        Ok(p) => p,
+        Err(e) => return err_response(StatusCode::BAD_REQUEST, e).into_response(),
+    };
+
+    let vector = match provider.embed(req.text).await {
+        Ok(v) => v,
+        Err(e) => return err_response(StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+    };
+
+    let mut mgr = state.manager.write().unwrap();
+    match mgr.get_collection_mut(&name) {
+        None => err_response(StatusCode::NOT_FOUND, format!("collection '{name}' not found"))
+            .into_response(),
+        Some(col) => match col.upsert(req.id, vector, req.payload) {
+            Ok(()) => StatusCode::CREATED.into_response(),
+            Err(e) => err_response(StatusCode::BAD_REQUEST, e).into_response(),
+        },
+    }
+}
+
+async fn embed_search(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+    Json(req): Json<EmbedSearchRequest>,
+) -> impl IntoResponse {
+    // Get the model id without holding the lock
+    let model_id = {
+        let mgr = state.manager.read().unwrap();
+        match mgr.get_collection(&name) {
+            None => {
+                return err_response(
+                    StatusCode::NOT_FOUND,
+                    format!("collection '{name}' not found"),
+                )
+                .into_response()
+            }
+            Some(col) => match col.meta().embedding_model.clone() {
+                Some(m) => m,
+                None => {
+                    return err_response(
+                        StatusCode::BAD_REQUEST,
+                        format!("collection '{name}' has no embedding_model configured"),
+                    )
+                    .into_response()
+                }
+            },
+        }
+    };
+
+    let provider = match make_provider(&model_id) {
+        Ok(p) => p,
+        Err(e) => return err_response(StatusCode::BAD_REQUEST, e).into_response(),
+    };
+
+    let vector = match provider.embed(req.text).await {
+        Ok(v) => v,
+        Err(e) => return err_response(StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+    };
+
+    let mgr = state.manager.read().unwrap();
+    match mgr.get_collection(&name) {
+        None => err_response(StatusCode::NOT_FOUND, format!("collection '{name}' not found"))
+            .into_response(),
+        Some(col) => match col.search(&vector, req.k, req.filter.as_ref()) {
+            Ok(results) => Json(SearchResponse {
+                results: results
+                    .into_iter()
+                    .map(|r| SearchResultItem {
+                        id: r.id,
+                        distance: r.distance,
+                        payload: r.payload,
+                    })
+                    .collect(),
+            })
+            .into_response(),
+            Err(e) => err_response(StatusCode::BAD_REQUEST, e).into_response(),
+        },
+    }
+}
+
 // ── App builder (shared by main and tests) ────────────────────────────────────
 
 fn build_app(data_dir: PathBuf, api_key: Option<String>) -> Router {
@@ -281,6 +444,8 @@ fn build_app(data_dir: PathBuf, api_key: Option<String>) -> Router {
         .route("/collections/:name/vectors", post(upsert_vector))
         .route("/collections/:name/search", post(search_vectors))
         .route("/collections/:name/vectors/:id", delete(delete_vector))
+        .route("/collections/:name/embed-upsert", post(embed_upsert))
+        .route("/collections/:name/embed-search", post(embed_search))
         .with_state(state);
 
     if let Some(key) = api_key {
