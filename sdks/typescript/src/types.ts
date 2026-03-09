@@ -5,8 +5,11 @@ export type Metric = "l2" | "cosine" | "dot_product";
 
 /**
  * Index type for a collection.
+ * - "flat"  — exact brute-force (100 % recall, O(N·D) per query)
+ * - "hnsw"  — approximate graph search (~95–99 % recall, sub-linear)
+ * - "faiss" — FAISS-backed index; server must be compiled with --features faiss
  */
-export type IndexType = "flat" | "hnsw";
+export type IndexType = "flat" | "hnsw" | "faiss";
 
 /**
  * HNSW graph construction and search parameters.
@@ -39,6 +42,12 @@ export interface CreateCollectionOptions {
   auto_promote_threshold?: number;
   /** HNSW config to apply on auto-promotion. */
   promotion_hnsw_config?: HnswConfig;
+  /**
+   * FAISS factory string (only used when index_type = "faiss").
+   * Defaults to "Flat". Examples: "IVF1024,Flat", "HNSW32", "IVF256,PQ64".
+   * See https://github.com/facebookresearch/faiss/wiki/The-index-factory
+   */
+  faiss_factory?: string;
 }
 
 /**
