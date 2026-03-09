@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/vectordb-core",
+    "crates/vectordb-embeddings",
     "crates/vectordb-server",
     "crates/vectordb-cli",
     "crates/vectordb-python",
@@ -53,6 +54,9 @@ rand = "0.8"
 # Python bindings
 pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"] }
 tempfile = "3"
+
+# LRU cache for IndexRegistry
+lru = "0.12"
 
 [profile.release]
 opt-level = 3

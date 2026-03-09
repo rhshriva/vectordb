@@ -34,6 +34,18 @@ pub struct CollectionMeta {
     /// WAL entry count threshold that triggers automatic compaction.
     #[serde(default = "default_wal_compact_threshold")]
     pub wal_compact_threshold: usize,
+    /// When the vector count reaches this threshold the index is automatically
+    /// promoted from Flat to HNSW. `None` disables auto-promotion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_promote_threshold: Option<usize>,
+    /// HNSW config to use when auto-promoting. Falls back to `HnswConfig::default()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promotion_hnsw_config: Option<HnswConfig>,
+    /// Optional embedding model identifier (e.g. `"openai/text-embedding-3-small"`,
+    /// `"ollama/nomic-embed-text"`). When set, the server can accept raw text
+    /// inputs for embed-and-upsert / embed-and-search endpoints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_model: Option<String>,
 }
 
 fn default_wal_compact_threshold() -> usize {
@@ -154,6 +166,7 @@ impl Collection {
         }
 
         self.maybe_compact()?;
+        self.maybe_promote()?;
         Ok(())
     }
 
@@ -242,6 +255,47 @@ impl Collection {
         }
         Ok(())
     }
+
+    /// Promote from Flat → HNSW if `auto_promote_threshold` is set and reached.
+    fn maybe_promote(&mut self) -> Result<(), VectorDbError> {
+        let threshold = match self.meta.auto_promote_threshold {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        if self.meta.index_type != IndexType::Flat {
+            return Ok(()); // already HNSW or future type
+        }
+        if self.index.len() < threshold {
+            return Ok(());
+        }
+        self.promote_to_hnsw()
+    }
+
+    /// Rebuild the in-memory index as HNSW and atomically update `meta.json`.
+    pub fn promote_to_hnsw(&mut self) -> Result<(), VectorDbError> {
+        let cfg = self
+            .meta
+            .promotion_hnsw_config
+            .clone()
+            .unwrap_or_default();
+        let mut new_index = HnswIndex::new(self.meta.dimensions, self.meta.metric, cfg.clone());
+        for (id, vec) in self.index.iter_vectors() {
+            new_index.add(id, &vec)?;
+        }
+        new_index.flush();
+
+        self.index = Box::new(new_index);
+        self.meta.index_type = IndexType::Hnsw;
+        self.meta.hnsw_config = Some(cfg);
+
+        // Atomically update meta.json so next restart also loads HNSW
+        let meta_bytes = serde_json::to_vec_pretty(&self.meta)?;
+        let tmp = self.dir.join("meta.json.tmp");
+        std::fs::write(&tmp, &meta_bytes)?;
+        std::fs::rename(&tmp, self.dir.join("meta.json"))?;
+
+        Ok(())
+    }
 }
 
 fn build_index(meta: &CollectionMeta) -> Box<dyn VectorIndex> {
@@ -267,6 +321,9 @@ mod tests {
             index_type,
             hnsw_config: None,
             wal_compact_threshold: 50_000,
+            auto_promote_threshold: None,
+            promotion_hnsw_config: None,
+            embedding_model: None,
         }
     }
 
@@ -391,6 +448,33 @@ mod tests {
         let wal_content = std::fs::read_to_string(path.join("wal.log")).unwrap();
         let line_count = wal_content.lines().count();
         assert!(line_count <= 6, "expected at most 6 WAL lines after compaction, got {line_count}");
+    }
+
+    #[test]
+    fn collection_auto_promotes_flat_to_hnsw() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let mut meta = make_meta("test", IndexType::Flat);
+        meta.auto_promote_threshold = Some(3);
+        let mut col = Collection::create(&path, meta).unwrap();
+
+        col.upsert(1, vec![1.0, 0.0, 0.0], None).unwrap();
+        col.upsert(2, vec![0.0, 1.0, 0.0], None).unwrap();
+        // Still flat — threshold not reached yet
+        assert_eq!(col.meta().index_type, IndexType::Flat);
+
+        col.upsert(3, vec![0.0, 0.0, 1.0], None).unwrap();
+        // Should have promoted now
+        assert_eq!(col.meta().index_type, IndexType::Hnsw);
+
+        // Persist meta.json should reflect HNSW
+        let loaded = Collection::load(&path).unwrap();
+        assert_eq!(loaded.meta().index_type, IndexType::Hnsw);
+        assert_eq!(loaded.count(), 3);
+
+        // Search should still work
+        let results = loaded.search(&[1.0, 0.0, 0.0], 1, None).unwrap();
+        assert_eq!(results[0].id, 1);
     }
 
     #[test]

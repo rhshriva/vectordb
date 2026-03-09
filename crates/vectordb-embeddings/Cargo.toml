@@ -1,0 +1,14 @@
+[package]
+name = "vectordb-embeddings"
+version.workspace = true
+edition.workspace = true
+description = "Embedding model integrations for vectordb (OpenAI, Ollama)"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+async-trait = "0.1"
+tracing = { workspace = true }
