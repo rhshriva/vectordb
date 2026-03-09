@@ -38,7 +38,7 @@ type SharedState = Arc<AppState>;
 struct CreateCollectionRequest {
     dimensions: usize,
     metric: Option<Metric>,
-    /// "flat" or "hnsw" (default: "hnsw")
+    /// "flat", "hnsw", or "faiss" (default: "hnsw")
     index_type: Option<String>,
     hnsw: Option<HnswConfig>,
     /// Automatically promote from Flat to HNSW when vector count reaches this value.
@@ -51,6 +51,10 @@ struct CreateCollectionRequest {
     /// `"ollama/nomic-embed-text"`. Required for embed-upsert / embed-search endpoints.
     #[serde(default)]
     embedding_model: Option<String>,
+    /// FAISS factory string (only used when index_type = "faiss").
+    /// Defaults to "Flat". Examples: "IVF1024,Flat", "HNSW32", "IVF256,PQ64".
+    #[serde(default)]
+    faiss_factory: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -155,13 +159,23 @@ async fn create_collection(
 ) -> impl IntoResponse {
     let metric = req.metric.unwrap_or(Metric::Cosine);
     let index_type_str = req.index_type.as_deref().unwrap_or("hnsw");
-    let (index_type, hnsw_config) = match index_type_str {
-        "flat" => (IndexType::Flat, None),
-        "hnsw" => (IndexType::Hnsw, Some(req.hnsw.unwrap_or_default())),
+    let (index_type, hnsw_config, faiss_factory) = match index_type_str {
+        "flat" => (IndexType::Flat, None, None),
+        "hnsw" => (IndexType::Hnsw, Some(req.hnsw.unwrap_or_default()), None),
+        "faiss" => {
+            #[cfg(not(feature = "faiss"))]
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                "index type 'faiss' requires the server to be compiled with the 'faiss' feature",
+            )
+            .into_response();
+            #[cfg(feature = "faiss")]
+            (IndexType::Faiss, None, Some(req.faiss_factory.clone().unwrap_or_else(|| "Flat".to_string())))
+        }
         other => {
             return err_response(
                 StatusCode::BAD_REQUEST,
-                format!("unknown index type '{other}', use 'flat' or 'hnsw'"),
+                format!("unknown index type '{other}', use 'flat', 'hnsw', or 'faiss'"),
             )
             .into_response()
         }
@@ -177,6 +191,7 @@ async fn create_collection(
         auto_promote_threshold: req.auto_promote_threshold,
         promotion_hnsw_config: req.promotion_hnsw_config.clone(),
         embedding_model: req.embedding_model.clone(),
+        faiss_factory,
     };
 
     let mut mgr = state.manager.write().unwrap();
@@ -635,6 +650,8 @@ mod tests {
             .oneshot(post_json("/collections/bad", json!({"dimensions": 2, "index_type": "tree"})))
             .await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp.into_body()).await;
+        assert!(body["error"].as_str().unwrap().contains("flat"));
     }
 
     // ── Vectors ──

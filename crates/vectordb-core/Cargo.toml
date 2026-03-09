@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 description = "Core vector database engine — indexes, distance metrics, storage"
 
+[features]
+faiss = ["dep:faiss"]
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -13,6 +16,7 @@ uuid = { workspace = true }
 rand = { workspace = true }
 instant-distance = { workspace = true }
 lru = { workspace = true }
+faiss = { workspace = true, optional = true }
 
 [dev-dependencies]
 approx = "0.5"

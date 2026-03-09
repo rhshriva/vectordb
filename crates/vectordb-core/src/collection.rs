@@ -10,6 +10,8 @@ use crate::{
     payload::{FilterCondition, matches_filter},
     wal::{Wal, WalEntry},
 };
+#[cfg(feature = "faiss")]
+use crate::index::faiss::FaissIndex;
 
 /// How many extra candidates to fetch per filter pass (overscan factor).
 const FILTER_OVERSCAN: usize = 10;
@@ -20,6 +22,9 @@ const FILTER_OVERSCAN: usize = 10;
 pub enum IndexType {
     Flat,
     Hnsw,
+    /// FAISS index created via the factory string (e.g. `"Flat"`, `"IVF1024,Flat"`).
+    /// Requires the crate to be compiled with the `faiss` feature.
+    Faiss,
 }
 
 /// Persistent metadata for a collection (written once to `meta.json`).
@@ -46,6 +51,12 @@ pub struct CollectionMeta {
     /// inputs for embed-and-upsert / embed-and-search endpoints.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_model: Option<String>,
+    /// FAISS factory string used when `index_type == Faiss`.
+    /// Defaults to `"Flat"` (exact brute-force, SIMD-accelerated).
+    /// Examples: `"IVF1024,Flat"`, `"HNSW32"`, `"IVF256,PQ64"`.
+    /// Only meaningful when compiled with the `faiss` feature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub faiss_factory: Option<String>,
 }
 
 fn default_wal_compact_threshold() -> usize {
@@ -263,7 +274,7 @@ impl Collection {
             None => return Ok(()),
         };
         if self.meta.index_type != IndexType::Flat {
-            return Ok(()); // already HNSW or future type
+            return Ok(()); // already HNSW, FAISS, or other type
         }
         if self.index.len() < threshold {
             return Ok(());
@@ -304,6 +315,25 @@ fn build_index(meta: &CollectionMeta) -> Box<dyn VectorIndex> {
         IndexType::Hnsw => {
             let cfg = meta.hnsw_config.clone().unwrap_or_default();
             Box::new(HnswIndex::new(meta.dimensions, meta.metric, cfg))
+        }
+        IndexType::Faiss => {
+            #[cfg(feature = "faiss")]
+            {
+                let factory = meta
+                    .faiss_factory
+                    .clone()
+                    .unwrap_or_else(|| "Flat".to_string());
+                Box::new(
+                    FaissIndex::new(meta.dimensions, meta.metric, factory)
+                        .expect("failed to build FAISS index"),
+                )
+            }
+            #[cfg(not(feature = "faiss"))]
+            panic!(
+                "collection '{}' uses IndexType::Faiss but vectordb-core was compiled \
+                 without the 'faiss' feature; rebuild with `--features faiss`",
+                meta.name
+            )
         }
     }
 }

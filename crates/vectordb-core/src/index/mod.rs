@@ -1,5 +1,7 @@
 pub mod flat;
 pub mod hnsw;
+#[cfg(feature = "faiss")]
+pub mod faiss;
 
 use crate::{distance::Metric, error::VectorDbError};
 use serde::{Deserialize, Serialize};

@@ -8,6 +8,9 @@ description = "HTTP/JSON server for vectordb"
 name = "vectordb-server"
 path = "src/main.rs"
 
+[features]
+faiss = ["vectordb-core/faiss"]
+
 [dependencies]
 vectordb-core = { path = "../vectordb-core" }
 vectordb-embeddings = { path = "../vectordb-embeddings" }

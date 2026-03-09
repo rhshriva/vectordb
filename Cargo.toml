@@ -58,6 +58,9 @@ tempfile = "3"
 # LRU cache for IndexRegistry
 lru = "0.12"
 
+# FAISS bindings (optional; requires libfaiss_c to be installed or use features=["static"])
+faiss = { version = "0.13", optional = true }
+
 [profile.release]
 opt-level = 3
 lto = "fat"
