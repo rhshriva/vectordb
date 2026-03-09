@@ -334,7 +334,7 @@ impl PyClient {
             "hnsw" => (IndexType::Hnsw, Some(HnswConfig::default())),
             other => return Err(PyValueError::new_err(format!("unknown index_type {other:?}"))),
         };
-        let meta = CollectionMeta { name: name.clone(), dimensions, metric: m, index_type: it, hnsw_config, wal_compact_threshold: 50_000, auto_promote_threshold: None, promotion_hnsw_config: None, embedding_model: None };
+        let meta = CollectionMeta { name: name.clone(), dimensions, metric: m, index_type: it, hnsw_config, wal_compact_threshold: 50_000, auto_promote_threshold: None, promotion_hnsw_config: None, embedding_model: None, faiss_factory: None };
         let mut mgr = self.manager.lock().unwrap();
         mgr.create_collection(meta).map_err(vec_err_to_py)?;
         Ok(PyCollection { manager: Arc::clone(&self.manager), name })

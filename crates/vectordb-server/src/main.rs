@@ -160,8 +160,10 @@ async fn create_collection(
     let metric = req.metric.unwrap_or(Metric::Cosine);
     let index_type_str = req.index_type.as_deref().unwrap_or("hnsw");
     let (index_type, hnsw_config, faiss_factory) = match index_type_str {
-        "flat" => (IndexType::Flat, None, None),
-        "hnsw" => (IndexType::Hnsw, Some(req.hnsw.unwrap_or_default()), None),
+        // Pass req.faiss_factory through in all arms so the field is always consumed
+        // (prevents dead_code warnings when the faiss feature is disabled).
+        "flat" => (IndexType::Flat, None, req.faiss_factory),
+        "hnsw" => (IndexType::Hnsw, Some(req.hnsw.unwrap_or_default()), req.faiss_factory),
         "faiss" => {
             #[cfg(not(feature = "faiss"))]
             return err_response(
@@ -170,7 +172,7 @@ async fn create_collection(
             )
             .into_response();
             #[cfg(feature = "faiss")]
-            (IndexType::Faiss, None, Some(req.faiss_factory.clone().unwrap_or_else(|| "Flat".to_string())))
+            (IndexType::Faiss, None, Some(req.faiss_factory.unwrap_or_else(|| "Flat".to_string())))
         }
         other => {
             return err_response(

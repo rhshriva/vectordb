@@ -59,7 +59,8 @@ tempfile = "3"
 lru = "0.12"
 
 # FAISS bindings (optional; requires libfaiss_c to be installed or use features=["static"])
-faiss = { version = "0.13", optional = true }
+# NOTE: optional = true must live in the crate-level Cargo.toml, not here.
+faiss = "0.13"
 
 [profile.release]
 opt-level = 3

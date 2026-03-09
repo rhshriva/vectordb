@@ -110,6 +110,7 @@ mod tests {
             auto_promote_threshold: None,
             promotion_hnsw_config: None,
             embedding_model: None,
+            faiss_factory: None,
         }
     }
 
