@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
-# dev_build.sh — build, test, and optionally run vectordb components
+# dev_build.sh — build and test vectordb components
 #
 # Usage:
-#   ./dev_build.sh                  # build + test everything (no FAISS)
-#   ./dev_build.sh --faiss          # build + test with FAISS support (dynamic lib)
-#   ./dev_build.sh --faiss-static   # build + test with FAISS built from source (C++ toolchain required)
-#   ./dev_build.sh --server         # build + start the HTTP server
-#   ./dev_build.sh --server --faiss # build + start server with FAISS
-#   ./dev_build.sh --python         # build Python wheel + smoke-test
-#   ./dev_build.sh --release        # release-mode build (no tests)
-#   ./dev_build.sh --help           # show this message
+#   ./dev_build.sh                 # build + test everything (no FAISS)
+#   ./dev_build.sh --faiss         # build + test with FAISS support (dynamic lib)
+#   ./dev_build.sh --faiss-static  # build + test with FAISS built from source (C++ toolchain required)
+#   ./dev_build.sh --python        # build Python wheel + smoke-test
+#   ./dev_build.sh --release       # release-mode build (no tests)
+#   ./dev_build.sh --help          # show this message
 
 set -euo pipefail
 
@@ -25,7 +23,6 @@ die()     { echo -e "${RED}${BOLD}[error]${RESET} $*" >&2; exit 1; }
 # ── argument parsing ──────────────────────────────────────────────────────────
 OPT_FAISS=0        # dynamic libfaiss_c
 OPT_FAISS_STATIC=0 # build FAISS from source via faiss/static feature
-OPT_SERVER=0
 OPT_PYTHON=0
 OPT_RELEASE=0
 
@@ -33,11 +30,10 @@ for arg in "$@"; do
   case "$arg" in
     --faiss)        OPT_FAISS=1        ;;
     --faiss-static) OPT_FAISS_STATIC=1 ;;
-    --server)       OPT_SERVER=1       ;;
     --python)       OPT_PYTHON=1       ;;
     --release)      OPT_RELEASE=1      ;;
     --help|-h)
-      sed -n '2,16p' "$0" | sed 's/^# \?//'
+      sed -n '2,11p' "$0" | sed 's/^# \?//'
       exit 0
       ;;
     *) die "unknown option: $arg  (run with --help)" ;;
@@ -229,7 +225,7 @@ cargo build "${CARGO_FLAGS[@]}" $FEATURE_FLAG \
 success "Rust build complete"
 
 # ── tests ─────────────────────────────────────────────────────────────────────
-if [[ $OPT_SERVER -eq 0 && $OPT_PYTHON -eq 0 ]]; then
+if [[ $OPT_PYTHON -eq 0 ]]; then
   info "Running test suite…"
   # shellcheck disable=SC2086
   cargo test $FEATURE_FLAG
@@ -251,28 +247,6 @@ if [[ $OPT_PYTHON -eq 1 ]]; then
   success "Python bindings built and smoke-tested"
 fi
 
-# ── server ────────────────────────────────────────────────────────────────────
-if [[ $OPT_SERVER -eq 1 ]]; then
-  BIN_PATH="target/debug/vectordb-server"
-  [[ $OPT_RELEASE -eq 1 ]] && BIN_PATH="target/release/vectordb-server"
-
-  info "Starting vectordb-server…"
-  info "  Data directory : ${VECTORDB_DATA_DIR:-./data}"
-  info "  Port           : 8080"
-  info "  Auth           : ${VECTORDB_API_KEY:+enabled (key set)}${VECTORDB_API_KEY:-disabled (dev mode)}"
-  if [[ $OPT_FAISS -eq 1 ]]; then
-    if [[ $OPT_FAISS_STATIC -eq 1 ]]; then
-      info "  FAISS          : enabled (static)"
-    else
-      info "  FAISS          : enabled (dynamic)"
-    fi
-  fi
-  info "Press Ctrl-C to stop."
-  echo ""
-  RUST_LOG="${RUST_LOG:-vectordb_server=info,tower_http=debug}" \
-    exec "$BIN_PATH"
-fi
-
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""
 success "Done! Binaries are in:"
@@ -284,8 +258,9 @@ else
   echo "  target/debug/vdb"
 fi
 echo ""
-echo "Quick-start:"
-echo "  ./dev_build.sh --server                 # start the HTTP server (port 8080)"
-echo "  ./dev_build.sh --python                 # build Python wheel"
-echo "  ./dev_build.sh --faiss --server         # server with FAISS (dynamic lib)"
-echo "  ./dev_build.sh --faiss-static --server  # server with FAISS (built from source)"
+echo "To start the server:"
+if [[ $OPT_FAISS -eq 1 ]]; then
+  echo "  RUST_LOG=info ./target/debug/vectordb-server   # with FAISS support"
+else
+  echo "  RUST_LOG=info ./target/debug/vectordb-server"
+fi
