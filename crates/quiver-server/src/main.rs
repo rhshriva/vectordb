@@ -193,6 +193,7 @@ async fn create_collection(
         auto_promote_threshold: req.auto_promote_threshold,
         promotion_hnsw_config: req.promotion_hnsw_config.clone(),
         embedding_model: req.embedding_model.clone(),
+        ivf_config: None,
         faiss_factory,
     };
 

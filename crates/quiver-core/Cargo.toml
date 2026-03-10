@@ -17,6 +17,7 @@ rand = { workspace = true }
 instant-distance = { workspace = true }
 bincode = { workspace = true }
 lru = { workspace = true }
+memmap2 = { workspace = true }
 faiss = { workspace = true, optional = true }
 
 [dev-dependencies]

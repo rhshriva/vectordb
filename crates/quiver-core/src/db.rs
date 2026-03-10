@@ -79,6 +79,7 @@ impl Quiver {
             auto_promote_threshold: None,
             promotion_hnsw_config: None,
             embedding_model: None,
+            ivf_config: None,
             faiss_factory: None,
         };
         self.manager.create_collection(meta)
