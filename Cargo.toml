@@ -32,7 +32,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # ANN / HNSW
-instant-distance = "0.6"
+instant-distance = { version = "0.6", features = ["with-serde"] }
+memmap2 = "0.9"
 
 # SIMD-accelerated distance (optional feature)
 # simsimd = "3"

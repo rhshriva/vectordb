@@ -1,8 +1,12 @@
 pub mod flat;
 pub mod hnsw;
 pub mod quantized_flat;
+pub mod ivf;
+pub mod mmap_flat;
 #[cfg(feature = "faiss")]
 pub mod faiss;
+
+use std::path::Path;
 
 use crate::{distance::Metric, error::VectorDbError};
 use serde::{Deserialize, Serialize};
@@ -65,4 +69,19 @@ pub trait VectorIndex: Send + Sync {
     /// Rebuild internal graph/structures from current vectors.
     /// Default is a no-op; HNSW overrides this to rebuild the graph.
     fn flush(&mut self) {}
+
+    /// Persist the built graph structure to `path`.
+    /// Default is a no-op; HnswIndex overrides this to write the built graph.
+    fn save_graph(&self, _path: &Path) -> Result<(), VectorDbError> {
+        Ok(())
+    }
+
+    /// Load a previously saved graph from `path`, skipping a rebuild.
+    /// Default falls back to `flush()`; HnswIndex overrides to deserialize.
+    fn load_graph_mmap(&mut self, path: &Path) -> Result<(), VectorDbError> {
+        // Default: check if graph file exists and skip flush if not needed
+        let _ = path;
+        self.flush();
+        Ok(())
+    }
 }

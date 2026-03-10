@@ -9,7 +9,14 @@ use crate::{
     distance::Metric,
     embedder::TextEmbedder,
     error::VectorDbError,
-    index::{flat::FlatIndex, hnsw::{HnswConfig, HnswIndex}, quantized_flat::QuantizedFlatIndex, VectorIndex},
+    index::{
+        flat::FlatIndex,
+        hnsw::{HnswConfig, HnswIndex},
+        ivf::{IvfConfig, IvfIndex},
+        mmap_flat::MmapFlatIndex,
+        quantized_flat::QuantizedFlatIndex,
+        VectorIndex,
+    },
     payload::{FilterCondition, matches_filter},
     wal::{Wal, WalEntry},
 };
@@ -28,6 +35,12 @@ pub enum IndexType {
     /// Scalar-quantized (int8) brute-force index.
     /// ~4× lower memory than `Flat` with sub-1% recall loss.
     QuantizedFlat,
+    /// Inverted file index (k-means + posting lists).
+    /// Sub-linear approximate search; configure via [`IvfConfig`].
+    Ivf,
+    /// Memory-mapped flat index — vectors live on disk, accessed via mmap.
+    /// Keeps RAM usage near zero for large collections.
+    MmapFlat,
     /// FAISS index created via the factory string (e.g. `"Flat"`, `"IVF1024,Flat"`).
     /// Requires the crate to be compiled with the `faiss` feature.
     Faiss,
@@ -57,6 +70,9 @@ pub struct CollectionMeta {
     /// inputs for embed-and-upsert / embed-and-search endpoints.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_model: Option<String>,
+    /// IVF configuration used when `index_type == Ivf`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ivf_config: Option<IvfConfig>,
     /// FAISS factory string used when `index_type == Faiss`.
     /// Defaults to `"Flat"` (exact brute-force, SIMD-accelerated).
     /// Examples: `"IVF1024,Flat"`, `"HNSW32"`, `"IVF256,PQ64"`.
@@ -104,7 +120,7 @@ impl Collection {
         let meta_bytes = serde_json::to_vec_pretty(&meta)?;
         std::fs::write(&meta_path, &meta_bytes)?;
 
-        let index = build_index(&meta);
+        let index = build_index(&meta, &dir);
         let wal = Wal::open(dir.join("wal.log"))?;
 
         Ok(Self {
@@ -131,7 +147,7 @@ impl Collection {
         let meta_bytes = std::fs::read(&meta_path)?;
         let meta: CollectionMeta = serde_json::from_slice(&meta_bytes)?;
 
-        let mut index = build_index(&meta);
+        let mut index = build_index(&meta, &dir);
         let mut payloads: HashMap<u64, serde_json::Value> = HashMap::new();
 
         Wal::replay(dir.join("wal.log"), |entry| match entry {
@@ -154,8 +170,9 @@ impl Collection {
             }
         })?;
 
-        // For HNSW: rebuild graph after replay
-        index.flush();
+        // For HNSW: try to load persisted graph to skip O(N log N) rebuild;
+        // falls back to flush() if the graph file is absent or stale.
+        index.load_graph_mmap(&dir.join("hnsw.graph"))?;
 
         let wal = Wal::open(dir.join("wal.log"))?;
 
@@ -338,6 +355,8 @@ impl Collection {
         // Reopen WAL in append mode after compaction
         self.wal = Wal::open(self.dir.join("wal.log"))?;
         self.wal.reset_entry_count(count);
+        // Persist HNSW graph so the next load skips the rebuild
+        self.index.save_graph(&self.dir.join("hnsw.graph"))?;
         Ok(())
     }
 
@@ -390,13 +409,24 @@ impl Collection {
     }
 }
 
-fn build_index(meta: &CollectionMeta) -> Box<dyn VectorIndex> {
+fn build_index(meta: &CollectionMeta, dir: &Path) -> Box<dyn VectorIndex> {
     match meta.index_type {
         IndexType::Flat => Box::new(FlatIndex::new(meta.dimensions, meta.metric)),
         IndexType::QuantizedFlat => Box::new(QuantizedFlatIndex::new(meta.dimensions, meta.metric)),
         IndexType::Hnsw => {
             let cfg = meta.hnsw_config.clone().unwrap_or_default();
             Box::new(HnswIndex::new(meta.dimensions, meta.metric, cfg))
+        }
+        IndexType::Ivf => {
+            let cfg = meta.ivf_config.clone().unwrap_or_default();
+            Box::new(IvfIndex::new(meta.dimensions, meta.metric, cfg))
+        }
+        IndexType::MmapFlat => {
+            let data_path = dir.join("vectors.mmap");
+            Box::new(
+                MmapFlatIndex::new(meta.dimensions, meta.metric, data_path)
+                    .expect("failed to open MmapFlatIndex"),
+            )
         }
         IndexType::Faiss => {
             #[cfg(feature = "faiss")]
@@ -436,6 +466,7 @@ mod tests {
             auto_promote_threshold: None,
             promotion_hnsw_config: None,
             embedding_model: None,
+            ivf_config: None,
             faiss_factory: None,
         }
     }

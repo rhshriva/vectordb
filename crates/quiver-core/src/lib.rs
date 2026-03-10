@@ -14,6 +14,8 @@ pub use error::VectorDbError;
 pub use index::{IndexConfig, SearchResult, VectorIndex};
 pub use index::{flat::FlatIndex, hnsw::{HnswConfig, HnswIndex}};
 pub use index::quantized_flat::QuantizedFlatIndex;
+pub use index::ivf::{IvfConfig, IvfIndex};
+pub use index::mmap_flat::MmapFlatIndex;
 
 pub use collection::{Collection, CollectionMeta, CollectionSearchResult, IndexType};
 pub use manager::CollectionManager;
