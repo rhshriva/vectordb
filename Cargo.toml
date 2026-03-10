@@ -55,6 +55,9 @@ rand = "0.8"
 pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"] }
 tempfile = "3"
 
+# Binary serialization for index snapshots and WAL
+bincode = "1"
+
 # LRU cache for IndexRegistry
 lru = "0.12"
 

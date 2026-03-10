@@ -17,8 +17,9 @@ pub enum VectorDbError {
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),
 
+    /// Serialization/deserialization error (JSON, bincode, etc.)
     #[error("serialization error: {0}")]
-    Serialization(#[from] serde_json::Error),
+    Serialization(String),
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -31,4 +32,10 @@ pub enum VectorDbError {
 
     #[error("WAL corruption at entry {entry}: {reason}")]
     WalCorruption { entry: usize, reason: String },
+}
+
+impl From<serde_json::Error> for VectorDbError {
+    fn from(e: serde_json::Error) -> Self {
+        VectorDbError::Serialization(e.to_string())
+    }
 }

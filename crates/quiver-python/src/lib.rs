@@ -2,7 +2,7 @@ use pyo3::exceptions::{PyIOError, PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use quiver_core::{
     collection::{CollectionMeta, IndexType},
     distance::Metric,
@@ -248,7 +248,7 @@ impl PyHnswIndex {
 
 #[pyclass(name = "Collection")]
 struct PyCollection {
-    manager: Arc<Mutex<CollectionManager>>,
+    manager: Arc<RwLock<CollectionManager>>,
     name: String,
 }
 
@@ -261,7 +261,7 @@ impl PyCollection {
             _ => None,
         };
         let name = self.name.clone();
-        let mut mgr = self.manager.lock().unwrap();
+        let mut mgr = self.manager.write().unwrap();
         let col = mgr.get_collection_mut(&name)
             .ok_or_else(|| PyKeyError::new_err(format!("collection '{name}' not found")))?;
         py.allow_threads(|| col.upsert(id, vector, p)).map_err(vec_err_to_py)
@@ -274,7 +274,7 @@ impl PyCollection {
             _ => None,
         };
         let name = self.name.clone();
-        let mgr = self.manager.lock().unwrap();
+        let mgr = self.manager.read().unwrap();
         let col = mgr.get_collection(&name)
             .ok_or_else(|| PyKeyError::new_err(format!("collection '{name}' not found")))?;
         let results = py.allow_threads(|| col.search(&query, k, f.as_ref())).map_err(vec_err_to_py)?;
@@ -291,7 +291,7 @@ impl PyCollection {
 
     fn delete(&mut self, py: Python<'_>, id: u64) -> PyResult<bool> {
         let name = self.name.clone();
-        let mut mgr = self.manager.lock().unwrap();
+        let mut mgr = self.manager.write().unwrap();
         let col = mgr.get_collection_mut(&name)
             .ok_or_else(|| PyKeyError::new_err(format!("collection '{name}' not found")))?;
         py.allow_threads(|| col.delete(id)).map_err(vec_err_to_py)
@@ -299,7 +299,7 @@ impl PyCollection {
 
     #[getter]
     fn count(&self) -> usize {
-        let mgr = self.manager.lock().unwrap();
+        let mgr = self.manager.read().unwrap();
         mgr.get_collection(&self.name).map(|c| c.count()).unwrap_or(0)
     }
 
@@ -314,7 +314,7 @@ impl PyCollection {
 
 #[pyclass(name = "Client")]
 struct PyClient {
-    manager: Arc<Mutex<CollectionManager>>,
+    manager: Arc<RwLock<CollectionManager>>,
 }
 
 #[pymethods]
@@ -323,7 +323,7 @@ impl PyClient {
     #[pyo3(signature = (path = "./data"))]
     fn new(path: &str) -> PyResult<Self> {
         let mgr = CollectionManager::open(Path::new(path)).map_err(vec_err_to_py)?;
-        Ok(Self { manager: Arc::new(Mutex::new(mgr)) })
+        Ok(Self { manager: Arc::new(RwLock::new(mgr)) })
     }
 
     #[pyo3(signature = (name, dimensions, metric = "cosine", index_type = "hnsw"))]
@@ -335,13 +335,13 @@ impl PyClient {
             other => return Err(PyValueError::new_err(format!("unknown index_type {other:?}"))),
         };
         let meta = CollectionMeta { name: name.clone(), dimensions, metric: m, index_type: it, hnsw_config, wal_compact_threshold: 50_000, auto_promote_threshold: None, promotion_hnsw_config: None, embedding_model: None, faiss_factory: None };
-        let mut mgr = self.manager.lock().unwrap();
+        let mut mgr = self.manager.write().unwrap();
         mgr.create_collection(meta).map_err(vec_err_to_py)?;
         Ok(PyCollection { manager: Arc::clone(&self.manager), name })
     }
 
     fn get_collection(&self, name: &str) -> PyResult<PyCollection> {
-        let mgr = self.manager.lock().unwrap();
+        let mgr = self.manager.read().unwrap();
         if mgr.get_collection(name).is_none() {
             return Err(PyKeyError::new_err(format!("collection '{name}' not found")));
         }
@@ -351,7 +351,7 @@ impl PyClient {
     #[pyo3(signature = (name, dimensions, metric = "cosine"))]
     fn get_or_create_collection(&mut self, name: &str, dimensions: usize, metric: &str) -> PyResult<PyCollection> {
         {
-            let mgr = self.manager.lock().unwrap();
+            let mgr = self.manager.read().unwrap();
             if mgr.get_collection(name).is_some() {
                 return Ok(PyCollection { manager: Arc::clone(&self.manager), name: name.to_string() });
             }
@@ -360,17 +360,17 @@ impl PyClient {
     }
 
     fn delete_collection(&mut self, name: &str) -> PyResult<bool> {
-        let mut mgr = self.manager.lock().unwrap();
+        let mut mgr = self.manager.write().unwrap();
         mgr.delete_collection(name).map_err(vec_err_to_py)
     }
 
     fn list_collections(&self) -> Vec<String> {
-        let mgr = self.manager.lock().unwrap();
+        let mgr = self.manager.read().unwrap();
         mgr.list_collections().iter().map(|m| m.name.clone()).collect()
     }
 
     fn __repr__(&self) -> String {
-        let count = self.manager.lock().unwrap().list_collections().len();
+        let count = self.manager.read().unwrap().list_collections().len();
         format!("Client(collections={count})")
     }
 }

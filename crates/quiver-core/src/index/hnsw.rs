@@ -141,13 +141,13 @@ impl HnswIndex {
         self.built = Some(BuiltHnsw { hnsw });
     }
 
-    /// Save the index to a JSON file at `path`.
+    /// Save the index to a binary file at `path` (bincode format).
     ///
     /// The HNSW graph itself is not persisted — it is rebuilt from the stored
     /// vectors when [`load`] calls [`flush`] after deserializing.
     pub fn save(&self, path: &str) -> Result<(), VectorDbError> {
         let file = std::fs::File::create(path)?;
-        let writer = BufWriter::new(file);
+        let mut writer = BufWriter::new(file);
         let snapshot = HnswIndexSnapshot {
             dimensions: self.config.dimensions,
             metric: self.config.metric,
@@ -155,18 +155,20 @@ impl HnswIndex {
             flush_threshold: self.flush_threshold,
             vectors: self.all_vectors.clone(),
         };
-        serde_json::to_writer(writer, &snapshot)?;
+        bincode::serialize_into(&mut writer, &snapshot)
+            .map_err(|e| VectorDbError::Serialization(e.to_string()))?;
         Ok(())
     }
 
-    /// Load an index from a JSON file previously written by [`save`].
+    /// Load an index from a binary file previously written by [`save`].
     ///
     /// The HNSW graph is rebuilt immediately via [`flush`], so the returned
     /// index is ready for ANN search.
     pub fn load(path: &str) -> Result<Self, VectorDbError> {
         let file = std::fs::File::open(path)?;
         let reader = BufReader::new(file);
-        let snapshot: HnswIndexSnapshot = serde_json::from_reader(reader)?;
+        let snapshot: HnswIndexSnapshot = bincode::deserialize_from(reader)
+            .map_err(|e| VectorDbError::Serialization(e.to_string()))?;
         let mut index = Self {
             config: IndexConfig {
                 dimensions: snapshot.dimensions,

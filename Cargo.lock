@@ -167,6 +167,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "bincode"
+version = "1.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1287,6 +1296,80 @@ dependencies = [
 ]
 
 [[package]]
+name = "quiver-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "quiver-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "quiver-core"
+version = "0.1.0"
+dependencies = [
+ "approx",
+ "bincode",
+ "faiss",
+ "instant-distance",
+ "lru",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "quiver-embeddings"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "quiver-python"
+version = "0.1.0"
+dependencies = [
+ "pyo3",
+ "quiver-core",
+ "serde_json",
+]
+
+[[package]]
+name = "quiver-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "http-body-util",
+ "quiver-core",
+ "quiver-embeddings",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tower 0.4.13",
+ "tower-http 0.5.2",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2134,79 +2217,6 @@ name = "vcpkg"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
-
-[[package]]
-name = "vectordb-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "vectordb-core",
-]
-
-[[package]]
-name = "vectordb-core"
-version = "0.1.0"
-dependencies = [
- "approx",
- "faiss",
- "instant-distance",
- "lru",
- "rand 0.8.5",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 1.0.69",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "vectordb-embeddings"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "vectordb-python"
-version = "0.1.0"
-dependencies = [
- "pyo3",
- "serde_json",
- "vectordb-core",
-]
-
-[[package]]
-name = "vectordb-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "http-body-util",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tower 0.4.13",
- "tower-http 0.5.2",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "vectordb-core",
- "vectordb-embeddings",
-]
 
 [[package]]
 name = "want"

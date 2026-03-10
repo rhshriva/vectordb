@@ -125,12 +125,16 @@ impl Collection {
         let mut payloads: HashMap<u64, serde_json::Value> = HashMap::new();
 
         Wal::replay(dir.join("wal.log"), |entry| match entry {
-            WalEntry::Add { id, vector, payload } => {
+            WalEntry::Add { id, vector, payload_bytes } => {
                 // Idempotent upsert on replay
                 index.delete(id);
                 let _ = index.add(id, &vector);
-                match payload {
-                    Some(p) => { payloads.insert(id, p); }
+                match payload_bytes {
+                    Some(b) => {
+                        if let Ok(p) = serde_json::from_slice(&b) {
+                            payloads.insert(id, p);
+                        }
+                    }
                     None => { payloads.remove(&id); }
                 }
             }
@@ -164,7 +168,8 @@ impl Collection {
         let entry = WalEntry::Add {
             id,
             vector: vector.clone(),
-            payload: payload.clone(),
+            payload_bytes: payload.as_ref()
+                .map(|p| serde_json::to_vec(p).unwrap_or_default()),
         };
         self.wal.append(&entry)?;
 
@@ -249,7 +254,8 @@ impl Collection {
             .map(|(id, vector)| WalEntry::Add {
                 id,
                 vector,
-                payload: self.payloads.get(&id).cloned(),
+                payload_bytes: self.payloads.get(&id)
+                    .map(|p| serde_json::to_vec(p).unwrap_or_default()),
             })
             .collect();
         let count = live.len();
@@ -475,10 +481,10 @@ mod tests {
         }
 
         // After 6 inserts (threshold=5 crossed), WAL should have been compacted.
-        // The WAL file should contain exactly the live entries (6), not 5+6=11.
-        let wal_content = std::fs::read_to_string(path.join("wal.log")).unwrap();
-        let line_count = wal_content.lines().count();
-        assert!(line_count <= 6, "expected at most 6 WAL lines after compaction, got {line_count}");
+        // Replay must yield at most 6 frames (compacted), not 5+6=11 (uncompacted).
+        let mut frame_count = 0usize;
+        Wal::replay(path.join("wal.log"), |_| { frame_count += 1; }).unwrap();
+        assert!(frame_count <= 6, "expected at most 6 WAL frames after compaction, got {frame_count}");
     }
 
     #[test]

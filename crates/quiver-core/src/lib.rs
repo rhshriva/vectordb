@@ -1,4 +1,5 @@
 pub mod collection;
+pub mod db;
 pub mod distance;
 pub mod error;
 pub mod index;
@@ -17,3 +18,6 @@ pub use manager::CollectionManager;
 pub use registry::IndexRegistry;
 pub use payload::{FieldFilter, FieldOp, FilterCondition, Payload, matches_filter};
 pub use wal::{Wal, WalEntry};
+
+/// Top-level embedded API — the main entry point for library users.
+pub use db::Quiver;
