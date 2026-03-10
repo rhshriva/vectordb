@@ -44,6 +44,12 @@ fn vec_err_to_py(e: VectorDbError) -> PyErr {
         VectorDbError::WalCorruption { entry, reason } => {
             PyRuntimeError::new_err(format!("WAL corruption at entry {entry}: {reason}"))
         }
+        VectorDbError::EmbeddingError(msg) => {
+            PyRuntimeError::new_err(format!("embedding error: {msg}"))
+        }
+        VectorDbError::NoEmbedder(name) => {
+            PyRuntimeError::new_err(format!("no embedder configured for collection '{name}'"))
+        }
     }
 }
 

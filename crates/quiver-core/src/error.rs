@@ -32,6 +32,15 @@ pub enum VectorDbError {
 
     #[error("WAL corruption at entry {entry}: {reason}")]
     WalCorruption { entry: usize, reason: String },
+
+    /// Returned when a text embedding call fails (network, API, or model error).
+    #[error("embedding error: {0}")]
+    EmbeddingError(String),
+
+    /// Returned when `upsert_text` or `search_text` is called but no embedder
+    /// has been attached to the collection via `set_embedder`.
+    #[error("no embedder configured for collection '{0}'; call set_embedder first")]
+    NoEmbedder(String),
 }
 
 impl From<serde_json::Error> for VectorDbError {

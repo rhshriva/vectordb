@@ -5,6 +5,7 @@ edition.workspace = true
 description = "Embedding model integrations for Quiver (OpenAI, Ollama)"
 
 [dependencies]
+quiver-core = { path = "../quiver-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

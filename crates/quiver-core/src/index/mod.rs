@@ -1,5 +1,6 @@
 pub mod flat;
 pub mod hnsw;
+pub mod quantized_flat;
 #[cfg(feature = "faiss")]
 pub mod faiss;
 

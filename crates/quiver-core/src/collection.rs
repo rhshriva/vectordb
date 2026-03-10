@@ -3,10 +3,13 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use std::sync::Arc;
+
 use crate::{
     distance::Metric,
+    embedder::TextEmbedder,
     error::VectorDbError,
-    index::{flat::FlatIndex, hnsw::{HnswConfig, HnswIndex}, VectorIndex},
+    index::{flat::FlatIndex, hnsw::{HnswConfig, HnswIndex}, quantized_flat::QuantizedFlatIndex, VectorIndex},
     payload::{FilterCondition, matches_filter},
     wal::{Wal, WalEntry},
 };
@@ -22,6 +25,9 @@ const FILTER_OVERSCAN: usize = 10;
 pub enum IndexType {
     Flat,
     Hnsw,
+    /// Scalar-quantized (int8) brute-force index.
+    /// ~4× lower memory than `Flat` with sub-1% recall loss.
+    QuantizedFlat,
     /// FAISS index created via the factory string (e.g. `"Flat"`, `"IVF1024,Flat"`).
     /// Requires the crate to be compiled with the `faiss` feature.
     Faiss,
@@ -79,6 +85,9 @@ pub struct Collection {
     payloads: HashMap<u64, serde_json::Value>,
     wal: Wal,
     dir: PathBuf,
+    /// Optional embedder for `upsert_text` / `search_text`.
+    /// Not persisted — must be re-attached after loading via `set_embedder`.
+    embedder: Option<Arc<dyn TextEmbedder>>,
 }
 
 impl Collection {
@@ -104,6 +113,7 @@ impl Collection {
             payloads: HashMap::new(),
             wal,
             dir,
+            embedder: None,
         })
     }
 
@@ -155,6 +165,7 @@ impl Collection {
             payloads,
             wal,
             dir,
+            embedder: None,
         })
     }
 
@@ -246,6 +257,70 @@ impl Collection {
         &self.meta
     }
 
+    // ── Embedding helpers ──────────────────────────────────────────────────────
+
+    /// Attach a [`TextEmbedder`] to this collection, enabling [`upsert_text`]
+    /// and [`search_text`].
+    ///
+    /// If the embedder reports a known dimensionality that does not match the
+    /// collection's configured dimensions, an error is returned.
+    ///
+    /// The embedder is **not persisted** — it must be re-attached after each
+    /// process restart.
+    ///
+    /// [`upsert_text`]: Collection::upsert_text
+    /// [`search_text`]: Collection::search_text
+    pub fn set_embedder(&mut self, embedder: Arc<dyn TextEmbedder>) -> Result<(), VectorDbError> {
+        if let Some(dims) = embedder.dimensions() {
+            if dims != self.meta.dimensions {
+                return Err(VectorDbError::InvalidConfig(format!(
+                    "embedder produces {dims}-dim vectors but collection '{}' expects {}",
+                    self.meta.name, self.meta.dimensions
+                )));
+            }
+        }
+        self.embedder = Some(embedder);
+        Ok(())
+    }
+
+    /// Embed `text` with the attached embedder, then upsert the resulting vector.
+    ///
+    /// Returns [`VectorDbError::NoEmbedder`] if no embedder has been set.
+    pub fn upsert_text(
+        &mut self,
+        id: u64,
+        text: &str,
+        payload: Option<serde_json::Value>,
+    ) -> Result<(), VectorDbError> {
+        let embedder = self
+            .embedder
+            .clone()
+            .ok_or_else(|| VectorDbError::NoEmbedder(self.meta.name.clone()))?;
+        let vector = embedder
+            .embed(text)
+            .map_err(|e| VectorDbError::EmbeddingError(e.to_string()))?;
+        self.upsert(id, vector, payload)
+    }
+
+    /// Embed `text` with the attached embedder, then search for the `k`
+    /// nearest neighbours.
+    ///
+    /// Returns [`VectorDbError::NoEmbedder`] if no embedder has been set.
+    pub fn search_text(
+        &self,
+        text: &str,
+        k: usize,
+    ) -> Result<Vec<CollectionSearchResult>, VectorDbError> {
+        let embedder = self
+            .embedder
+            .as_ref()
+            .ok_or_else(|| VectorDbError::NoEmbedder(self.meta.name.clone()))?;
+        let query = embedder
+            .embed(text)
+            .map_err(|e| VectorDbError::EmbeddingError(e.to_string()))?;
+        self.search(&query, k, None)
+    }
+
     /// Force WAL compaction now.
     pub fn compact(&mut self) -> Result<(), VectorDbError> {
         let live: Vec<WalEntry> = self
@@ -318,6 +393,7 @@ impl Collection {
 fn build_index(meta: &CollectionMeta) -> Box<dyn VectorIndex> {
     match meta.index_type {
         IndexType::Flat => Box::new(FlatIndex::new(meta.dimensions, meta.metric)),
+        IndexType::QuantizedFlat => Box::new(QuantizedFlatIndex::new(meta.dimensions, meta.metric)),
         IndexType::Hnsw => {
             let cfg = meta.hnsw_config.clone().unwrap_or_default();
             Box::new(HnswIndex::new(meta.dimensions, meta.metric, cfg))

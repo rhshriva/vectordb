@@ -18,12 +18,14 @@
 
 pub mod openai;
 pub mod ollama;
+pub mod blocking;
 
 use async_trait::async_trait;
 
 // Re-exports
 pub use openai::OpenAiProvider;
 pub use ollama::OllamaProvider;
+pub use blocking::BlockingEmbedder;
 
 /// Errors produced by embedding providers.
 #[derive(Debug, thiserror::Error)]

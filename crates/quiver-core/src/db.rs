@@ -27,10 +27,12 @@
 //! ```
 
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::{
     collection::{CollectionMeta, CollectionSearchResult, IndexType},
     distance::Metric,
+    embedder::TextEmbedder,
     error::VectorDbError,
     index::hnsw::HnswConfig,
     manager::CollectionManager,
@@ -163,6 +165,63 @@ impl Quiver {
         let col = self.manager.get_collection(collection)
             .ok_or_else(|| VectorDbError::CollectionNotFound(collection.to_string()))?;
         col.search(query, k, Some(filter))
+    }
+
+    // ── Text embedding helpers ─────────────────────────────────────────────────
+
+    /// Attach a [`TextEmbedder`] to `collection`, enabling [`upsert_text`] and
+    /// [`search_text`].
+    ///
+    /// The embedder is **not persisted** — re-attach it after each process
+    /// restart.
+    ///
+    /// [`upsert_text`]: Quiver::upsert_text
+    /// [`search_text`]: Quiver::search_text
+    pub fn set_embedder(
+        &mut self,
+        collection: &str,
+        embedder: Arc<dyn TextEmbedder>,
+    ) -> Result<(), VectorDbError> {
+        let col = self.manager.get_collection_mut(collection)
+            .ok_or_else(|| VectorDbError::CollectionNotFound(collection.to_string()))?;
+        col.set_embedder(embedder)
+    }
+
+    /// Embed `text` using the collection's attached embedder, then upsert the
+    /// resulting vector under `id`.
+    ///
+    /// Returns [`VectorDbError::NoEmbedder`] if [`set_embedder`] has not been
+    /// called for this collection.
+    ///
+    /// [`set_embedder`]: Quiver::set_embedder
+    pub fn upsert_text(
+        &mut self,
+        collection: &str,
+        id: u64,
+        text: &str,
+        payload: Option<serde_json::Value>,
+    ) -> Result<(), VectorDbError> {
+        let col = self.manager.get_collection_mut(collection)
+            .ok_or_else(|| VectorDbError::CollectionNotFound(collection.to_string()))?;
+        col.upsert_text(id, text, payload)
+    }
+
+    /// Embed `text` using the collection's attached embedder, then return the
+    /// `k` nearest neighbours.
+    ///
+    /// Returns [`VectorDbError::NoEmbedder`] if [`set_embedder`] has not been
+    /// called for this collection.
+    ///
+    /// [`set_embedder`]: Quiver::set_embedder
+    pub fn search_text(
+        &self,
+        collection: &str,
+        text: &str,
+        k: usize,
+    ) -> Result<Vec<CollectionSearchResult>, VectorDbError> {
+        let col = self.manager.get_collection(collection)
+            .ok_or_else(|| VectorDbError::CollectionNotFound(collection.to_string()))?;
+        col.search_text(text, k)
     }
 }
 
