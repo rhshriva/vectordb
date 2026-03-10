@@ -3,9 +3,9 @@ requires = ["maturin>=1.7,<2"]
 build-backend = "maturin"
 
 [project]
-name = "vectordb"
+name = "quiver"
 version = "0.1.0"
-description = "Fast vector database with Python bindings"
+description = "Fast embedded vector database with Python bindings"
 requires-python = ">=3.8"
 license = { text = "MIT" }
 classifiers = [
@@ -15,6 +15,6 @@ classifiers = [
 ]
 
 [tool.maturin]
-manifest-path = "crates/vectordb-python/Cargo.toml"
-module-name = "vectordb"
+manifest-path = "crates/quiver-python/Cargo.toml"
+module-name = "quiver"
 features = ["pyo3/extension-module"]

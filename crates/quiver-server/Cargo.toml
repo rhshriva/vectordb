@@ -1,19 +1,19 @@
 [package]
-name = "vectordb-server"
+name = "quiver-server"
 version.workspace = true
 edition.workspace = true
-description = "HTTP/JSON server for vectordb"
+description = "HTTP/JSON server for Quiver"
 
 [[bin]]
-name = "vectordb-server"
+name = "quiver-server"
 path = "src/main.rs"
 
 [features]
-faiss = ["vectordb-core/faiss"]
+faiss = ["quiver-core/faiss"]
 
 [dependencies]
-vectordb-core = { path = "../vectordb-core" }
-vectordb-embeddings = { path = "../vectordb-embeddings" }
+quiver-core = { path = "../quiver-core" }
+quiver-embeddings = { path = "../quiver-embeddings" }
 tokio = { workspace = true }
 axum = { workspace = true }
 tower-http = { workspace = true }

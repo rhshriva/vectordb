@@ -14,7 +14,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use tracing::info;
-use vectordb_core::{
+use quiver_core::{
     collection::{CollectionMeta, IndexType},
     distance::Metric,
     index::hnsw::HnswConfig,
@@ -22,7 +22,7 @@ use vectordb_core::{
     payload::FilterCondition,
     VectorDbError,
 };
-use vectordb_embeddings::{EmbeddingProvider, OllamaProvider, OpenAiProvider};
+use quiver_embeddings::{EmbeddingProvider, OllamaProvider, OpenAiProvider};
 
 // ── Shared state ─────────────────────────────────────────────────────────────
 
@@ -480,7 +480,7 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "vectordb_server=info,tower_http=debug".into()),
+                .unwrap_or_else(|_| "quiver_server=info,tower_http=debug".into()),
         )
         .init();
 
@@ -496,7 +496,7 @@ async fn main() {
     let app = build_app(PathBuf::from(data_dir), api_key);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
-    info!("vectordb-server listening on {addr}");
+    info!("quiver-server listening on {addr}");
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();

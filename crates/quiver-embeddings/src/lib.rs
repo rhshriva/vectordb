@@ -1,4 +1,4 @@
-//! Embedding model integrations for vectordb.
+//! Embedding model integrations for Quiver.
 //!
 //! Provides the [`EmbeddingProvider`] trait and concrete implementations for
 //! hosted models (OpenAI, Ollama) so that the server can accept raw text and
@@ -6,9 +6,9 @@
 //!
 //! # Example
 //! ```no_run
-//! use vectordb_embeddings::{EmbeddingProvider, OllamaProvider};
+//! use quiver_embeddings::{EmbeddingProvider, OllamaProvider};
 //!
-//! # async fn run() -> Result<(), vectordb_embeddings::EmbeddingError> {
+//! # async fn run() -> Result<(), quiver_embeddings::EmbeddingError> {
 //! let provider = OllamaProvider::new("http://localhost:11434", "nomic-embed-text");
 //! let vec = provider.embed("Hello, world!".to_string()).await?;
 //! println!("dims: {}", vec.len());

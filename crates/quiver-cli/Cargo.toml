@@ -1,15 +1,15 @@
 [package]
-name = "vectordb-cli"
+name = "quiver-cli"
 version.workspace = true
 edition.workspace = true
-description = "CLI tool for interacting with a vectordb-server"
+description = "CLI tool for interacting with a quiver-server"
 
 [[bin]]
-name = "vdb"
+name = "quiver"
 path = "src/main.rs"
 
 [dependencies]
-vectordb-core = { path = "../vectordb-core" }
+quiver-core = { path = "../quiver-core" }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -1,5 +1,5 @@
 [package]
-name = "vectordb-core"
+name = "quiver-core"
 version.workspace = true
 edition.workspace = true
 description = "Core vector database engine — indexes, distance metrics, storage"

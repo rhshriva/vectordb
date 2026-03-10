@@ -1,7 +1,7 @@
 {
-  "name": "vectordb-client",
+  "name": "quiver-client",
   "version": "0.1.0",
-  "description": "TypeScript client for the vectordb HTTP server",
+  "description": "TypeScript client for the Quiver HTTP server",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "type": "module",
@@ -14,7 +14,7 @@
   "files": [
     "dist"
   ],
-  "keywords": ["vector-database", "embeddings", "nearest-neighbor", "ai"],
+  "keywords": ["vector-database", "embeddings", "nearest-neighbor", "ai", "quiver"],
   "license": "MIT",
   "devDependencies": {
     "typescript": "^5.4.0",

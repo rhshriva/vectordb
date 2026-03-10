@@ -1,11 +1,11 @@
 import { describe, it, expect, beforeAll, afterAll, afterEach } from "vitest";
 import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
-import { VectorDbClient, VectorDbError } from "../src/client.js";
+import { QuiverClient, QuiverError } from "../src/client.js";
 
 const BASE_URL = "http://localhost:7070";
-const client = new VectorDbClient({ baseUrl: BASE_URL });
-const authedClient = new VectorDbClient({ baseUrl: BASE_URL, apiKey: "secret" });
+const client = new QuiverClient({ baseUrl: BASE_URL });
+const authedClient = new QuiverClient({ baseUrl: BASE_URL, apiKey: "secret" });
 
 // ── Mock server setup ─────────────────────────────────────────────────────────
 
@@ -65,7 +65,7 @@ afterAll(() => server.close());
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-describe("VectorDbClient", () => {
+describe("QuiverClient", () => {
   describe("createCollection", () => {
     it("sends correct request and resolves", async () => {
       await expect(
@@ -73,7 +73,7 @@ describe("VectorDbClient", () => {
       ).resolves.toBeUndefined();
     });
 
-    it("throws VectorDbError on conflict", async () => {
+    it("throws QuiverError on conflict", async () => {
       server.use(
         http.post(`${BASE_URL}/collections/:name`, () =>
           HttpResponse.json({ error: "collection already exists: docs" }, { status: 409 }),
@@ -81,7 +81,7 @@ describe("VectorDbClient", () => {
       );
       await expect(
         client.createCollection("docs", { dimensions: 3 }),
-      ).rejects.toBeInstanceOf(VectorDbError);
+      ).rejects.toBeInstanceOf(QuiverError);
     });
   });
 
@@ -171,17 +171,17 @@ describe("VectorDbClient", () => {
       expect(authHeader).toBe("Bearer secret");
     });
 
-    it("throws VectorDbError on 401", async () => {
+    it("throws QuiverError on 401", async () => {
       server.use(
         http.get(`${BASE_URL}/collections`, () =>
           HttpResponse.json({ error: "unauthorized" }, { status: 401 }),
         ),
       );
-      await expect(client.listCollections()).rejects.toBeInstanceOf(VectorDbError);
+      await expect(client.listCollections()).rejects.toBeInstanceOf(QuiverError);
     });
   });
 
-  describe("VectorDbError", () => {
+  describe("QuiverError", () => {
     it("includes status code", async () => {
       server.use(
         http.get(`${BASE_URL}/collections`, () =>
@@ -192,8 +192,8 @@ describe("VectorDbClient", () => {
         await client.listCollections();
         expect.fail("should have thrown");
       } catch (err) {
-        expect(err).toBeInstanceOf(VectorDbError);
-        expect((err as VectorDbError).statusCode).toBe(403);
+        expect(err).toBeInstanceOf(QuiverError);
+        expect((err as QuiverError).statusCode).toBe(403);
       }
     });
   });

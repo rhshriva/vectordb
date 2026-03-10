@@ -13,7 +13,7 @@
 //! # Usage
 //! ```no_run
 //! use std::path::Path;
-//! use vectordb_core::registry::IndexRegistry;
+//! use quiver_core::registry::IndexRegistry;
 //!
 //! let mut reg = IndexRegistry::open(Path::new("./data"), 16).unwrap();
 //! reg.with_collection_mut("my-coll", |col| {

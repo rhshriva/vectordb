@@ -1,4 +1,4 @@
-export { VectorDbClient, VectorDbError } from "./client.js";
+export { QuiverClient, QuiverError } from "./client.js";
 export type {
   ClientOptions,
   CollectionInfo,

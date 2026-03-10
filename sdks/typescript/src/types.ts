@@ -111,10 +111,10 @@ export interface CollectionInfo {
 }
 
 /**
- * Options for constructing a `VectorDbClient`.
+ * Options for constructing a `QuiverClient`.
  */
 export interface ClientOptions {
-  /** Base URL of the vectordb server. Default: "http://localhost:7070". */
+  /** Base URL of the Quiver server. Default: "http://localhost:7070". */
   baseUrl?: string;
   /** Bearer token for API key authentication. */
   apiKey?: string;

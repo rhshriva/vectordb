@@ -2,9 +2,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "vdb", about = "vectordb CLI — interact with a running vectordb-server")]
+#[command(name = "quiver", about = "Quiver CLI — interact with a running quiver-server")]
 struct Cli {
-    /// Base URL of the vectordb server
+    /// Base URL of the Quiver server
     #[arg(long, env = "VDB_HOST", default_value = "http://localhost:8080")]
     host: String,
 

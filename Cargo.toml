@@ -1,19 +1,19 @@
 [workspace]
 members = [
-    "crates/vectordb-core",
-    "crates/vectordb-embeddings",
-    "crates/vectordb-server",
-    "crates/vectordb-cli",
-    "crates/vectordb-python",
+    "crates/quiver-core",
+    "crates/quiver-embeddings",
+    "crates/quiver-server",
+    "crates/quiver-cli",
+    "crates/quiver-python",
 ]
 resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-authors = ["vectordb contributors"]
+authors = ["Quiver contributors"]
 license = "MIT"
-repository = "https://github.com/vectordb/vectordb"
+repository = "https://github.com/rhshriva/quiver"
 
 [workspace.dependencies]
 # Serialization

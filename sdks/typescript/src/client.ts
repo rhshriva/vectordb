@@ -1,13 +1,13 @@
 /**
- * VectorDbClient — zero-dependency TypeScript client for the vectordb HTTP server.
+ * QuiverClient — zero-dependency TypeScript client for the Quiver HTTP server.
  *
  * Uses the global `fetch` API (available in Node 18+, Deno, and all modern browsers).
  *
  * @example
  * ```ts
- * import { VectorDbClient } from "vectordb-client";
+ * import { QuiverClient } from "quiver-client";
  *
- * const db = new VectorDbClient({ baseUrl: "http://localhost:7070" });
+ * const db = new QuiverClient({ baseUrl: "http://localhost:7070" });
  *
  * await db.createCollection("docs", { dimensions: 768, metric: "cosine" });
  * await db.upsert("docs", 1, [0.1, 0.2, ...], { source: "readme" });
@@ -24,17 +24,17 @@ import type {
   SearchResult,
 } from "./types.js";
 
-export class VectorDbError extends Error {
+export class QuiverError extends Error {
   constructor(
     message: string,
     public readonly statusCode?: number,
   ) {
     super(message);
-    this.name = "VectorDbError";
+    this.name = "QuiverError";
   }
 }
 
-export class VectorDbClient {
+export class QuiverClient {
   private readonly baseUrl: string;
   private readonly headers: Record<string, string>;
 
@@ -50,7 +50,7 @@ export class VectorDbClient {
 
   /**
    * Create a new collection.
-   * @throws {VectorDbError} if the collection already exists (409) or the
+   * @throws {QuiverError} if the collection already exists (409) or the
    *   request is malformed (400).
    */
   async createCollection(
@@ -173,6 +173,6 @@ export class VectorDbClient {
     } catch {
       message = resp.statusText;
     }
-    throw new VectorDbError(message, resp.status);
+    throw new QuiverError(message, resp.status);
   }
 }

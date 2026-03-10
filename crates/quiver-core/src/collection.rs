@@ -330,7 +330,7 @@ fn build_index(meta: &CollectionMeta) -> Box<dyn VectorIndex> {
             }
             #[cfg(not(feature = "faiss"))]
             panic!(
-                "collection '{}' uses IndexType::Faiss but vectordb-core was compiled \
+                "collection '{}' uses IndexType::Faiss but quiver-core was compiled \
                  without the 'faiss' feature; rebuild with `--features faiss`",
                 meta.name
             )

@@ -1,14 +1,14 @@
 [package]
-name = "vectordb-python"
+name = "quiver-python"
 version.workspace = true
 edition.workspace = true
-description = "Python bindings for vectordb"
+description = "Python bindings for Quiver"
 
 [lib]
-name = "vectordb"
+name = "quiver"
 crate-type = ["cdylib"]
 
 [dependencies]
-vectordb-core = { path = "../vectordb-core" }
+quiver-core = { path = "../quiver-core" }
 pyo3 = { workspace = true }
 serde_json = { workspace = true }

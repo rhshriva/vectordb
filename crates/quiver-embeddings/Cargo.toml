@@ -1,8 +1,8 @@
 [package]
-name = "vectordb-embeddings"
+name = "quiver-embeddings"
 version.workspace = true
 edition.workspace = true
-description = "Embedding model integrations for vectordb (OpenAI, Ollama)"
+description = "Embedding model integrations for Quiver (OpenAI, Ollama)"
 
 [dependencies]
 serde = { workspace = true }

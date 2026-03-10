@@ -3,7 +3,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use vectordb_core::{
+use quiver_core::{
     collection::{CollectionMeta, IndexType},
     distance::Metric,
     error::VectorDbError,
@@ -376,7 +376,7 @@ impl PyClient {
 }
 
 #[pymodule]
-fn vectordb(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn quiver(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyFlatIndex>()?;
     m.add_class::<PyHnswIndex>()?;
     m.add_class::<PyClient>()?;

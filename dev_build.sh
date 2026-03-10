@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# dev_build.sh — build and test vectordb components
+# dev_build.sh — build and test Quiver components
 #
 # Usage:
 #   ./dev_build.sh                 # build + test everything (no FAISS)
@@ -15,7 +15,7 @@ set -euo pipefail
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
 
-info()    { echo -e "${CYAN}${BOLD}[vectordb]${RESET} $*"; }
+info()    { echo -e "${CYAN}${BOLD}[quiver]${RESET} $*"; }
 success() { echo -e "${GREEN}${BOLD}[ok]${RESET} $*"; }
 warn()    { echo -e "${YELLOW}${BOLD}[warn]${RESET} $*"; }
 die()     { echo -e "${RED}${BOLD}[error]${RESET} $*" >&2; exit 1; }
@@ -219,9 +219,9 @@ fi
 info "Building all Rust crates…"
 # shellcheck disable=SC2086
 cargo build "${CARGO_FLAGS[@]}" $FEATURE_FLAG \
-  -p vectordb-core \
-  -p vectordb-server \
-  -p vectordb-cli
+  -p quiver-core \
+  -p quiver-server \
+  -p quiver-cli
 success "Rust build complete"
 
 # ── tests ─────────────────────────────────────────────────────────────────────
@@ -242,8 +242,8 @@ if [[ $OPT_PYTHON -eq 1 ]]; then
     warn "Then re-run this script with --python"
     die "Aborting Python build: activate a venv first"
   fi
-  maturin develop --release -m crates/vectordb-python/Cargo.toml
-  python3 -c "import vectordb; print('vectordb module imported OK')"
+  maturin develop --release -m crates/quiver-python/Cargo.toml
+  python3 -c "import quiver; print('quiver module imported OK')"
   success "Python bindings built and smoke-tested"
 fi
 
@@ -251,16 +251,16 @@ fi
 echo ""
 success "Done! Binaries are in:"
 if [[ $OPT_RELEASE -eq 1 ]]; then
-  echo "  target/release/vectordb-server"
+  echo "  target/release/quiver-server"
   echo "  target/release/vdb"
 else
-  echo "  target/debug/vectordb-server"
+  echo "  target/debug/quiver-server"
   echo "  target/debug/vdb"
 fi
 echo ""
 echo "To start the server:"
 if [[ $OPT_FAISS -eq 1 ]]; then
-  echo "  RUST_LOG=info ./target/debug/vectordb-server   # with FAISS support"
+  echo "  RUST_LOG=info ./target/debug/quiver-server   # with FAISS support"
 else
-  echo "  RUST_LOG=info ./target/debug/vectordb-server"
+  echo "  RUST_LOG=info ./target/debug/quiver-server"
 fi
