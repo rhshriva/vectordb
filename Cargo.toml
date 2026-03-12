@@ -23,8 +23,7 @@ thiserror = "1"
 # Logging
 tracing = "0.1"
 
-# ANN / HNSW
-instant-distance = { version = "0.6", features = ["with-serde"] }
+# Memory-mapped files
 memmap2 = "0.9"
 
 # UUID
