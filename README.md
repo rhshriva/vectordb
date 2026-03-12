@@ -220,12 +220,52 @@ for hit in hits:
 
 Regular `upsert()` and `upsert_hybrid()` can be mixed freely in the same collection.
 
-## Build
+## Development
+
+### Prerequisites
+
+- Rust toolchain (`rustup`, `cargo`)
+- Python 3.8+
+
+### Environment setup
+
+```bash
+git clone https://github.com/rhshriva/Quiver.git && cd Quiver
+python3 -m venv .venv && source .venv/bin/activate
+pip install maturin pytest numpy
+maturin develop --release -m crates/quiver-python/Cargo.toml
+```
+
+### Build
 
 ```bash
 ./dev_build.sh               # build + test Rust core
 ./dev_build.sh --python       # also build Python wheel
 ./dev_build.sh --faiss --python  # with FAISS support
+```
+
+### Running tests
+
+```bash
+# Rust unit tests (175 tests)
+cargo test --workspace
+
+# Python functional tests (69 tests)
+pytest tests/ -v --ignore=tests/test_perf.py
+
+# Python performance benchmarks (insert throughput, search latency, recall)
+pytest tests/test_perf.py -v -s
+
+# All Python tests
+pytest tests/ -v -s
+```
+
+### Publishing
+
+```bash
+./publish.sh              # build cross-platform wheels + upload to PyPI
+./publish.sh --test       # upload to TestPyPI instead
+./publish.sh --build-only # build wheels without uploading
 ```
 
 ## License
