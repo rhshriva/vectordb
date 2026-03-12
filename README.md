@@ -9,7 +9,13 @@ No server, no network — runs fully in-process.
 pip install quiver-vector-db
 ```
 
-Or build from source:
+Prebuilt wheels are available for:
+- macOS (Apple Silicon / Intel)
+- Linux (x86_64 / ARM64)
+
+Python 3.8+ required.
+
+**Build from source** (requires Rust toolchain):
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
@@ -35,21 +41,107 @@ for hit in hits:
 
 Collections are persisted via WAL — reopen the same path and everything is restored.
 
+---
+
+## API Reference
+
+### `Client(path="./data")`
+
+Persistent vector database client. Opens a directory on disk; all writes are WAL-backed.
+
+| Method | Description |
+|--------|-------------|
+| `create_collection(name, dimensions, metric="cosine", index_type="hnsw")` | Create a new collection. `index_type`: `"hnsw"`, `"flat"`, `"quantized_flat"`, `"fp16_flat"`, `"ivf"`, `"ivf_pq"`, `"mmap_flat"` |
+| `get_collection(name)` | Get an existing collection. Raises `KeyError` if not found |
+| `get_or_create_collection(name, dimensions, metric="cosine")` | Get or create (defaults to HNSW) |
+| `delete_collection(name)` | Delete collection and all its data from disk |
+| `list_collections()` | Returns list of collection name strings |
+
+### `Collection`
+
+Returned by `Client.create_collection()` or `Client.get_collection()`.
+
+| Method | Description |
+|--------|-------------|
+| `upsert(id, vector, payload=None)` | Insert or update a vector with optional metadata dict |
+| `search(query, k, filter=None)` | Search k nearest vectors. Returns `[{"id", "distance", "payload"}]` |
+| `upsert_hybrid(id, vector, sparse_vector=None, payload=None)` | Upsert with optional sparse vector (`{dim_index: weight}`) |
+| `search_hybrid(dense_query, sparse_query, k, dense_weight=0.7, sparse_weight=0.3, filter=None)` | Hybrid search. Returns `[{"id", "score", "dense_distance", "sparse_score", "payload"}]` |
+| `delete(id)` | Delete a vector by ID. Returns `True` if found |
+| `count` | Property: number of dense vectors |
+| `sparse_count` | Property: number of sparse vectors |
+| `name` | Property: collection name |
+
+### `FlatIndex(dimensions, metric="l2")`
+
+Exact brute-force index. 100% recall, O(N*D) per query.
+
+| Method | Description |
+|--------|-------------|
+| `add(id, vector)` | Add a single vector |
+| `add_batch(entries)` | Add multiple vectors. `entries`: list of `(id, vector)` tuples |
+| `search(query, k)` | Returns `[{"id", "distance"}]` |
+| `delete(id)` | Returns `True` if removed |
+| `save(path)` | Save to binary file |
+| `FlatIndex.load(path)` | Static method: load from binary file |
+| `dimensions` | Property |
+| `metric` | Property |
+| `len(idx)` | Number of vectors |
+
+### `HnswIndex(dimensions, metric="l2", ef_construction=200, ef_search=50, m=12)`
+
+Graph-based approximate nearest-neighbour index. 95-99% recall.
+
+Same methods as `FlatIndex`, plus:
+
+| Method | Description |
+|--------|-------------|
+| `flush()` | Build the HNSW graph. Call after bulk inserts for best performance |
+
+**Parameters:**
+- `ef_construction` — build beam width (higher = better recall, slower build)
+- `ef_search` — query beam width (tunable at runtime)
+- `m` — graph edges per node (higher = better recall, more RAM)
+
+### `QuantizedFlatIndex(dimensions, metric="l2")`
+
+Int8 quantized brute-force. ~4x less RAM, ~99% recall. Same methods as `FlatIndex`.
+
+### `Fp16FlatIndex(dimensions, metric="l2")`
+
+Float16 quantized brute-force. 2x less RAM, >99.5% recall. Same methods as `FlatIndex`.
+
+### `IvfIndex(dimensions, metric="l2", n_lists=256, nprobe=16, train_size=4096)`
+
+Cluster-based ANN using k-means. Auto-trains after `train_size` inserts.
+
+Same methods as `FlatIndex`, plus `flush()`.
+
+**Parameters:**
+- `n_lists` — number of clusters (rule of thumb: `sqrt(N)`)
+- `nprobe` — clusters scanned per query
+- `train_size` — vectors buffered before auto-training
+
+### `IvfPqIndex(dimensions, metric="l2", n_lists=256, nprobe=16, train_size=4096, pq_m=8, pq_k_sub=256)`
+
+IVF with product quantization. ~96x memory reduction for 1536-dim vectors. Same methods as `IvfIndex`.
+
+**Additional parameters:**
+- `pq_m` — number of sub-quantizers (must divide `dimensions`)
+- `pq_k_sub` — centroids per sub-quantizer
+- Memory per vector = `pq_m` bytes
+
+### `MmapFlatIndex(dimensions, metric="l2", path="./mmap_index.qvec")`
+
+Memory-mapped brute-force. Near-zero RAM; pages loaded on demand by the OS.
+
+Same methods as `FlatIndex` (except no `save`/`load` — data is always on disk), plus `flush()`.
+
+---
+
 ## Index types
 
-Seven index types, all usable from Python:
-
-```python
-db = quiver.Client(path="./data")
-
-col = db.create_collection("name", dimensions=768, metric="cosine", index_type="hnsw")          # default
-col = db.create_collection("name", dimensions=768, metric="cosine", index_type="flat")           # exact
-col = db.create_collection("name", dimensions=768, metric="cosine", index_type="quantized_flat") # int8, ~4x less RAM
-col = db.create_collection("name", dimensions=768, metric="cosine", index_type="fp16_flat")      # float16, 2x less RAM
-col = db.create_collection("name", dimensions=768, metric="l2",     index_type="ivf")            # cluster-based ANN
-col = db.create_collection("name", dimensions=768, metric="l2",     index_type="ivf_pq")         # PQ compressed, ~96x less RAM
-col = db.create_collection("name", dimensions=768, metric="cosine", index_type="mmap_flat")      # disk-mapped, near-zero RAM
-```
+Seven index types, all usable via `Client` or standalone:
 
 | Index | Recall | RAM | Best for |
 |-------|--------|-----|----------|
@@ -61,46 +153,32 @@ col = db.create_collection("name", dimensions=768, metric="cosine", index_type="
 | `ivf_pq` | ~90%+ | ~96x less (PQ codes) | Million-scale, extreme compression |
 | `mmap_flat` | 100% | Near-zero RSS | Dataset larger than RAM |
 
-## In-memory indexes
-
-Low-level index objects live in RAM only. Nothing hits disk unless you call `.save()`.
-
 ```python
 import quiver_vector_db as quiver
 
-# Exact brute-force
+# Via Client (WAL-persisted)
+db = quiver.Client(path="./data")
+col = db.create_collection("name", dimensions=768, metric="cosine", index_type="hnsw")
+
+# Standalone in-memory
 idx = quiver.FlatIndex(dimensions=384, metric="cosine")
-idx.add(id=1, vector=[...])
-idx.add_batch([(2, [...]), (3, [...])])
-results = idx.search(query=[...], k=10)
-idx.save("index.bin")
-loaded = quiver.FlatIndex.load("index.bin")
-
-# HNSW approximate
-hnsw = quiver.HnswIndex(dimensions=384, metric="cosine", ef_construction=200, ef_search=50, m=12)
-hnsw.add(id=1, vector=[...])
-hnsw.flush()  # build graph after bulk inserts
-results = hnsw.search(query=[...], k=10)
-
-# Int8 quantized          — same API as FlatIndex
+idx = quiver.HnswIndex(dimensions=384, metric="cosine", ef_construction=200, ef_search=50, m=12)
 idx = quiver.QuantizedFlatIndex(dimensions=384, metric="cosine")
-
-# Float16 quantized       — same API as FlatIndex
 idx = quiver.Fp16FlatIndex(dimensions=384, metric="cosine")
-
-# IVF cluster-based
 idx = quiver.IvfIndex(dimensions=384, metric="l2", n_lists=256, nprobe=16, train_size=4096)
-
-# IVF + Product Quantization
 idx = quiver.IvfPqIndex(dimensions=384, metric="l2", n_lists=256, nprobe=16, train_size=4096, pq_m=8, pq_k_sub=256)
-
-# Memory-mapped flat
 idx = quiver.MmapFlatIndex(dimensions=384, metric="cosine", path="./vectors.qvec")
 ```
 
-## Payload & filtered search
+## Distance metrics
 
-Attach metadata to vectors and filter at query time:
+| Metric | String | Use when |
+|--------|--------|----------|
+| Cosine | `"cosine"` | Text/image embeddings (most common) |
+| L2 | `"l2"` | Geometry, sensor data |
+| Dot product | `"dot_product"` | Pre-normalised vectors |
+
+## Payload & filtered search
 
 ```python
 col.upsert(id=1, vector=[...], payload={"category": "tech", "score": 4.8})
@@ -121,14 +199,12 @@ hits = col.search(query=[...], k=5, filter={
 Combine dense vector similarity with sparse keyword signals (e.g. BM25/SPLADE weights):
 
 ```python
-# Upsert with both dense and sparse vectors
 col.upsert_hybrid(
     id=1, vector=[...],
     sparse_vector={42: 0.8, 100: 0.5, 3001: 0.3},
     payload={"title": "Rust guide"},
 )
 
-# Hybrid search — weighted fusion of dense and sparse scores
 hits = col.search_hybrid(
     dense_query=[...],
     sparse_query={42: 0.7, 100: 0.6},
@@ -143,38 +219,6 @@ for hit in hits:
 ```
 
 Regular `upsert()` and `upsert_hybrid()` can be mixed freely in the same collection.
-
-## Collection management
-
-```python
-db = quiver.Client(path="./data")
-
-col = db.get_or_create_collection("docs", dimensions=768, metric="cosine")
-col = db.get_collection("docs")
-
-db.list_collections()       # ['docs', ...]
-col.count                   # number of dense vectors
-col.sparse_count            # number of sparse vectors
-
-col.delete(id=42)
-db.delete_collection("docs")
-```
-
-## Distance metrics
-
-| Metric | String | Use when |
-|--------|--------|----------|
-| Cosine | `"cosine"` | Text/image embeddings (most common) |
-| L2 | `"l2"` | Geometry, sensor data |
-| Dot product | `"dot_product"` | Pre-normalised vectors |
-
-## Parameter tuning
-
-**HNSW:** `ef_construction` (build quality, default 200), `ef_search` (query quality, default 50), `m` (graph connectivity, default 12).
-
-**IVF / IVF-PQ:** `n_lists` (clusters, default 256, rule of thumb: `sqrt(N)`), `nprobe` (clusters scanned, default 16), `train_size` (auto-train threshold, default 4096).
-
-**PQ-specific:** `pq_m` (sub-quantizers, must divide dimensions), `pq_k_sub` (centroids per sub-quantizer, default 256). Memory per vector = `pq_m` bytes.
 
 ## Build
 
