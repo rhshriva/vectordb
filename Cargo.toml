@@ -1,9 +1,6 @@
 [workspace]
 members = [
     "crates/quiver-core",
-    "crates/quiver-embeddings",
-    "crates/quiver-server",
-    "crates/quiver-cli",
     "crates/quiver-python",
 ]
 resolver = "2"
@@ -20,31 +17,15 @@ repository = "https://github.com/rhshriva/Quiver"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# Async runtime
-tokio = { version = "1", features = ["full"] }
-
 # Error handling
 thiserror = "1"
-anyhow = "1"
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # ANN / HNSW
 instant-distance = { version = "0.6", features = ["with-serde"] }
 memmap2 = "0.9"
-
-# SIMD-accelerated distance (optional feature)
-# simsimd = "3"
-
-# HTTP server
-axum = { version = "0.7", features = ["json"] }
-tower = "0.4"
-tower-http = { version = "0.5", features = ["trace", "cors"] }
-
-# CLI
-clap = { version = "4", features = ["derive", "env"] }
 
 # UUID
 uuid = { version = "1", features = ["v4", "serde"] }
