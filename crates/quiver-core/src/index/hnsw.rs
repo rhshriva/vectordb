@@ -105,7 +105,7 @@ impl HnswIndex {
             hnsw_config,
             staging: Vec::new(),
             all_vectors: HashMap::new(),
-            flush_threshold: 1000,
+            flush_threshold: 50_000,
             built: None,
         }
     }
@@ -259,9 +259,35 @@ impl VectorIndex for HnswIndex {
         if self.all_vectors.contains_key(&id) {
             return Err(VectorDbError::DuplicateId(id));
         }
-        self.all_vectors.insert(id, vector.to_vec());
-        self.staging.push((id, vector.to_vec()));
+        let v = vector.to_vec();
+        self.staging.push((id, v.clone()));
+        self.all_vectors.insert(id, v);
         self.maybe_flush();
+        Ok(())
+    }
+
+    /// Optimized batch insert: adds all vectors first, then flushes once.
+    fn add_batch(&mut self, entries: &[(u64, Vec<f32>)]) -> Result<(), VectorDbError> {
+        // Validate all entries first
+        for (id, vec) in entries {
+            if vec.len() != self.config.dimensions {
+                return Err(VectorDbError::DimensionMismatch {
+                    expected: self.config.dimensions,
+                    got: vec.len(),
+                });
+            }
+            if self.all_vectors.contains_key(id) {
+                return Err(VectorDbError::DuplicateId(*id));
+            }
+        }
+        // Reserve capacity to avoid reallocations
+        self.all_vectors.reserve(entries.len());
+        self.staging.reserve(entries.len());
+        // Insert all without intermediate flushes
+        for (id, vec) in entries {
+            self.staging.push((*id, vec.clone()));
+            self.all_vectors.insert(*id, vec.clone());
+        }
         Ok(())
     }
 
