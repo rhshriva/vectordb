@@ -15,6 +15,7 @@
 /// - HnswIndex: ~95–99% recall (tunable), O(log N · ef) query, no single-delete support
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter};
+use std::path::Path;
 
 use crate::{
     distance::Metric,
@@ -57,7 +58,7 @@ impl Default for HnswConfig {
 // instant-distance requires implementing the `instant_distance::Point` trait.
 // We wrap our f32 vectors in a newtype so we can implement the foreign trait.
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct HnswPoint(Vec<f32>, Metric);
 
 impl instant_distance::Point for HnswPoint {
@@ -92,6 +93,7 @@ pub struct HnswIndex {
     built: Option<BuiltHnsw>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct BuiltHnsw {
     hnsw: instant_distance::HnswMap<HnswPoint, u64>,
 }
@@ -141,13 +143,13 @@ impl HnswIndex {
         self.built = Some(BuiltHnsw { hnsw });
     }
 
-    /// Save the index to a JSON file at `path`.
+    /// Save the index to a binary file at `path` (bincode format).
     ///
     /// The HNSW graph itself is not persisted — it is rebuilt from the stored
     /// vectors when [`load`] calls [`flush`] after deserializing.
     pub fn save(&self, path: &str) -> Result<(), VectorDbError> {
         let file = std::fs::File::create(path)?;
-        let writer = BufWriter::new(file);
+        let mut writer = BufWriter::new(file);
         let snapshot = HnswIndexSnapshot {
             dimensions: self.config.dimensions,
             metric: self.config.metric,
@@ -155,18 +157,20 @@ impl HnswIndex {
             flush_threshold: self.flush_threshold,
             vectors: self.all_vectors.clone(),
         };
-        serde_json::to_writer(writer, &snapshot)?;
+        bincode::serialize_into(&mut writer, &snapshot)
+            .map_err(|e| VectorDbError::Serialization(e.to_string()))?;
         Ok(())
     }
 
-    /// Load an index from a JSON file previously written by [`save`].
+    /// Load an index from a binary file previously written by [`save`].
     ///
     /// The HNSW graph is rebuilt immediately via [`flush`], so the returned
     /// index is ready for ANN search.
     pub fn load(path: &str) -> Result<Self, VectorDbError> {
         let file = std::fs::File::open(path)?;
         let reader = BufReader::new(file);
-        let snapshot: HnswIndexSnapshot = serde_json::from_reader(reader)?;
+        let snapshot: HnswIndexSnapshot = bincode::deserialize_from(reader)
+            .map_err(|e| VectorDbError::Serialization(e.to_string()))?;
         let mut index = Self {
             config: IndexConfig {
                 dimensions: snapshot.dimensions,
@@ -180,6 +184,37 @@ impl HnswIndex {
         };
         index.flush();
         Ok(index)
+    }
+
+    /// Persist the built HNSW graph to `path` so that future loads can skip
+    /// the O(N log N) rebuild step.  Does nothing if the graph hasn't been
+    /// built yet (returns `Ok(())`).
+    pub fn save_graph(&self, path: &Path) -> Result<(), VectorDbError> {
+        let Some(built) = &self.built else { return Ok(()); };
+        let file = std::fs::File::create(path)?;
+        let mut writer = BufWriter::new(file);
+        bincode::serialize_into(&mut writer, built)
+            .map_err(|e| VectorDbError::Serialization(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Load a previously saved HNSW graph from `path`.
+    ///
+    /// On success, the built graph is replaced and the (expensive) `flush()`
+    /// rebuild is skipped.  If the file does not exist this is a no-op so
+    /// that old on-disk collections (without a graph file) still load by
+    /// falling back to the rebuild path in [`Collection::load`].
+    pub fn load_graph_mmap(&mut self, path: &Path) -> Result<(), VectorDbError> {
+        if !path.exists() {
+            return Ok(());
+        }
+        // Memory-map the graph file for zero-copy byte access.
+        let file = std::fs::File::open(path)?;
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        let built: BuiltHnsw = bincode::deserialize(&mmap[..])
+            .map_err(|e| VectorDbError::Serialization(e.to_string()))?;
+        self.built = Some(built);
+        Ok(())
     }
 
     /// Set the `ef_search` parameter at runtime (no rebuild needed).
@@ -310,6 +345,27 @@ impl VectorIndex for HnswIndex {
 
     fn config(&self) -> &IndexConfig {
         &self.config
+    }
+
+    fn iter_vectors(&self) -> Box<dyn Iterator<Item = (u64, Vec<f32>)> + '_> {
+        Box::new(self.all_vectors.iter().map(|(&id, v)| (id, v.clone())))
+    }
+
+    fn flush(&mut self) {
+        HnswIndex::flush(self);
+    }
+
+    fn save_graph(&self, path: &std::path::Path) -> Result<(), VectorDbError> {
+        HnswIndex::save_graph(self, path)
+    }
+
+    fn load_graph_mmap(&mut self, path: &std::path::Path) -> Result<(), VectorDbError> {
+        HnswIndex::load_graph_mmap(self, path)?;
+        // If graph file was absent, fall back to rebuild
+        if self.built.is_none() && !self.all_vectors.is_empty() {
+            HnswIndex::flush(self);
+        }
+        Ok(())
     }
 }
 

@@ -37,24 +37,26 @@ impl FlatIndex {
         }
     }
 
-    /// Save the index to a JSON file at `path`.
+    /// Save the index to a binary file at `path` (bincode format).
     pub fn save(&self, path: &str) -> Result<(), VectorDbError> {
         let file = std::fs::File::create(path)?;
-        let writer = BufWriter::new(file);
+        let mut writer = BufWriter::new(file);
         let snapshot = FlatIndexSnapshot {
             dimensions: self.config.dimensions,
             metric: self.config.metric,
             vectors: self.vectors.clone(),
         };
-        serde_json::to_writer(writer, &snapshot)?;
+        bincode::serialize_into(&mut writer, &snapshot)
+            .map_err(|e| VectorDbError::Serialization(e.to_string()))?;
         Ok(())
     }
 
-    /// Load an index from a JSON file previously written by [`save`].
+    /// Load an index from a binary file previously written by [`save`].
     pub fn load(path: &str) -> Result<Self, VectorDbError> {
         let file = std::fs::File::open(path)?;
         let reader = BufReader::new(file);
-        let snapshot: FlatIndexSnapshot = serde_json::from_reader(reader)?;
+        let snapshot: FlatIndexSnapshot = bincode::deserialize_from(reader)
+            .map_err(|e| VectorDbError::Serialization(e.to_string()))?;
         Ok(Self {
             config: IndexConfig {
                 dimensions: snapshot.dimensions,
@@ -137,6 +139,10 @@ impl VectorIndex for FlatIndex {
 
     fn config(&self) -> &IndexConfig {
         &self.config
+    }
+
+    fn iter_vectors(&self) -> Box<dyn Iterator<Item = (u64, Vec<f32>)> + '_> {
+        Box::new(self.vectors.iter().map(|(&id, v)| (id, v.clone())))
     }
 }
 
@@ -308,9 +314,9 @@ mod tests {
     }
 
     #[test]
-    fn load_malformed_json_returns_serialization_error() {
-        let path = "/tmp/flat_bad.json";
-        std::fs::write(path, b"not valid json").unwrap();
+    fn load_malformed_data_returns_serialization_error() {
+        let path = "/tmp/flat_bad.bin";
+        std::fs::write(path, b"not valid bincode data").unwrap();
         let result = FlatIndex::load(path);
         assert!(matches!(result, Err(VectorDbError::Serialization(_))));
     }

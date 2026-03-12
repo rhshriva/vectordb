@@ -1,622 +1,608 @@
-# vectordb
+# Quiver
 
-A high-performance vector database @ Scale, written in Rust.
+An **embedded** vector database written in Rust with a Python SDK.
+
+Runs fully in-process — no server, no network, no extra processes.
+
+Two storage modes:
+
+| Mode | How | When |
+|------|-----|------|
+| **Persistent** | `Client(path=...)` | WAL-backed; survives restarts |
+| **In-memory** | Low-level index objects | Temporary; nothing written to disk unless you call `.save()` |
 
 ---
 
 ## Table of Contents
 
-- [Overview](#overview)
-- [Use Cases](#use-cases)
-- [Architecture](#architecture)
-- [Getting Started](#getting-started)
-- [REST API](#rest-api)
-- [CLI](#cli)
-- [Index Types](#index-types)
-- [Distance Metrics](#distance-metrics)
-- [Python Bindings](#python-bindings)
-- [Development Setup](#development-setup)
-- [Building on macOS](#building-on-macos)
+1. [Python SDK](#python-sdk)
+   - [Installation](#installation)
+   - [Persistent storage — Client](#persistent-storage--client)
+   - [In-memory storage — low-level indexes](#in-memory-storage--low-level-indexes)
+   - [Payload metadata](#payload-metadata)
+   - [Filtered search](#filtered-search)
+   - [Index types](#index-types)
+   - [Collection management](#collection-management)
+   - [Real-world example](#real-world-example)
+2. [Rust library](#rust-library)
+   - [Persistent storage](#persistent-storage-rust)
+   - [In-memory storage](#in-memory-storage-rust)
+   - [All index types via CollectionManager](#all-index-types-via-collectionmanager)
+3. [Distance metrics](#distance-metrics)
+4. [Index type reference](#index-type-reference)
+5. [On-disk layout](#on-disk-layout)
+6. [Build](#build)
 
 ---
 
-## Overview
+## Python SDK
 
-**vectordb** stores, indexes, and searches high-dimensional vectors at scale.
-It exposes a simple HTTP/JSON API (backed by [Axum](https://github.com/tokio-rs/axum))
-and ships a CLI (`vdb`) for quick interaction. The core engine is a pluggable
-`VectorIndex` trait with two built-in implementations — an exact `FlatIndex`
-and an approximate HNSW index powered by [instant-distance](https://github.com/InstantDomainSearch/instant-distance).
-
----
-
-## Use Cases
-
-### 1. Semantic Search
-Embed documents, web pages, or knowledge-base articles with a text embedding
-model (e.g. `text-embedding-3-small`). Store the embeddings in vectordb and
-retrieve the most semantically relevant results for any natural-language query —
-no keyword matching required.
-
-```
-User query → embedding model → query vector
-→ vectordb search (top-k) → relevant documents
-```
-
-### 2. Recommendation Systems
-Convert user behaviour (clicks, purchases, ratings) or item attributes into
-latent vectors and find the nearest neighbours to power "you may also like"
-or "users like you also bought" features.
-
-### 3. Image & Multimodal Search
-Store CLIP or similar vision embeddings for images, videos, or audio clips.
-Search by uploading a new image or text description to find visually or
-semantically similar media instantly.
-
-### 4. Retrieval-Augmented Generation (RAG)
-Pair vectordb with a large language model to build RAG pipelines. At query
-time, retrieve the most relevant context chunks from your corpus and inject
-them into the LLM prompt — grounding responses in up-to-date or proprietary
-knowledge.
-
-```
-User question
- → embed → vectordb kNN search → top-k context chunks
- → LLM prompt + context → grounded answer
-```
-
-### 5. Anomaly & Fraud Detection
-Embed transactional or behavioural events and flag items whose nearest-neighbour
-distance exceeds a threshold as potential anomalies — useful for fraud
-detection, intrusion detection, and quality control.
-
-### 6. Duplicate & Near-Duplicate Detection
-Hash or embed content (text, code, images) and perform a similarity search to
-surface near-duplicates before ingesting them, enabling deduplication pipelines
-at scale.
-
-### 7. Clustering & Exploratory Data Analysis
-Use vectordb as a fast kNN oracle for clustering algorithms (k-means, DBSCAN,
-HDBSCAN) over large embedding datasets without loading everything into memory.
-
-### 8. Drug Discovery & Molecular Search
-Store molecular fingerprint vectors and retrieve structurally similar compounds
-— accelerating virtual screening and lead optimisation workflows.
-
----
-
-## Architecture
-
-```
-┌────────────────────────────────────────┐
-│            vectordb-server             │  HTTP/JSON (port 8080)
-│              (Axum + Tokio)            │
-└────────────────┬───────────────────────┘
-                 │ calls
-┌────────────────▼───────────────────────┐
-│            vectordb-core               │
-│  ┌──────────────┐  ┌────────────────┐  │
-│  │  FlatIndex   │  │   HnswIndex    │  │
-│  │  (exact L2/  │  │  (ANN, ~95-99% │  │
-│  │  cosine/dot) │  │   recall)      │  │
-│  └──────────────┘  └────────────────┘  │
-│         implements VectorIndex trait   │
-└────────────────────────────────────────┘
-         ▲
-┌────────┴───────┐
-│  vectordb-cli  │  `vdb` binary — talks to the server over HTTP
-└────────────────┘
-```
-
-| Crate              | Role |
-|--------------------|------|
-| `vectordb-core`    | Index trait, FlatIndex, HnswIndex, distance metrics |
-| `vectordb-server`  | REST API server (collections, upsert, search, delete) |
-| `vectordb-cli`     | `vdb` command-line client |
-| `vectordb-python`  | PyO3 Python bindings (`FlatIndex`, `HnswIndex`) |
-
----
-
-## Getting Started
-
-### Build
-
-```bash
-cargo build --release
-```
-
-Binaries land in `target/release/`:
-- `vectordb-server` — the HTTP server
-- `vdb` — the CLI client
-
-### Run the server
-
-```bash
-./target/release/vectordb-server
-# INFO vectordb-server listening on 0.0.0.0:8080
-```
-
-Set `RUST_LOG=debug` for verbose output.
-
----
-
-## Python Bindings
-
-The `vectordb-python` crate exposes `FlatIndex` and `HnswIndex` directly to Python via [PyO3](https://pyo3.rs).
-
-### Install
+### Installation
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
-maturin develop --release   # builds and installs into the active venv
+pip install maturin
+
+# Build and install in development mode:
+maturin develop --release -m crates/quiver-python/Cargo.toml
+
+# Verify:
+python -c "import quiver; print('Quiver ready')"
 ```
 
-### Usage
+---
+
+### Persistent storage — Client
+
+`quiver.Client` opens a directory on disk. Every write is appended to a
+write-ahead log (WAL) and survives process restarts.
 
 ```python
-import vectordb
+import quiver
 
-# --- FlatIndex (exact search) ---
-idx = vectordb.FlatIndex(dimensions=3, metric="cosine")
-idx.add(1, [1.0, 0.0, 0.0])
-idx.add(2, [0.0, 1.0, 0.0])
-idx.add_batch([(3, [0.0, 0.0, 1.0]), (4, [1.0, 1.0, 0.0])])
+# Open (or create) a database directory.
+# All previously saved collections are loaded automatically.
+db = quiver.Client(path="./my_quiver_data")
 
-results = idx.search([1.0, 0.0, 0.0], k=2)
-# [{"id": 1, "distance": 0.0}, {"id": 4, "distance": ...}]
+# Create a collection — name, vector dimensions, distance metric.
+# Supported index types: "hnsw" (default, approximate) or "flat" (exact).
+col = db.create_collection("sentences", dimensions=384, metric="cosine")
 
-idx.delete(4)
-print(len(idx))          # 3
-print(idx.dimensions)    # 3
-print(idx.metric)        # "cosine"
+# Insert vectors. IDs are unsigned integers.
+col.upsert(id=1, vector=[0.12, 0.45, ...])   # 384-dim list of floats
+col.upsert(id=2, vector=[0.98, 0.01, ...])
+col.upsert(id=3, vector=[0.55, 0.33, ...])
 
-# Persist to disk
-idx.save("my_index.json")
-idx2 = vectordb.FlatIndex.load("my_index.json")
+# Search for the k nearest neighbours.
+hits = col.search(query=[0.13, 0.44, ...], k=5)
 
-# --- HnswIndex (approximate search) ---
-hnsw = vectordb.HnswIndex(dimensions=128, metric="l2", ef_construction=200, ef_search=50, m=12)
-hnsw.add_batch([(i, [float(i)] * 128) for i in range(10_000)])
-hnsw.flush()   # build the HNSW graph
-
-results = hnsw.search([0.0] * 128, k=5)
-hnsw.save("hnsw.json")
-hnsw2 = vectordb.HnswIndex.load("hnsw.json")  # graph rebuilt automatically
+for hit in hits:
+    print(f"id={hit['id']:4d}  distance={hit['distance']:.6f}")
 ```
 
-### API reference
+Reopen the same path in a later session — all collections are restored:
 
-| Class | Method / property | Description |
-|-------|-------------------|-------------|
-| `FlatIndex(dimensions, metric="l2")` | constructor | Create exact index |
-| `HnswIndex(dimensions, metric="l2", ef_construction=200, ef_search=50, m=12)` | constructor | Create ANN index |
-| both | `.add(id, vector)` | Insert one vector |
-| both | `.add_batch([(id, vector), ...])` | Insert many vectors |
-| both | `.search(query, k)` → `list[dict]` | Return k nearest neighbours |
-| both | `.delete(id)` → `bool` | Remove a vector |
-| both | `.save(path)` | Persist index to JSON |
-| both | `cls.load(path)` | Restore index from JSON |
-| both | `len(idx)` | Number of stored vectors |
-| both | `.dimensions`, `.metric` | Read-only properties |
-| `HnswIndex` | `.flush()` | Rebuild HNSW graph immediately |
-
-Metrics: `"l2"`, `"cosine"`, `"dot_product"`.
-
----
-
-## Development Setup
-
-### 1. Prerequisites
-
-```bash
-# Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source ~/.cargo/env
-
-# Python 3.8+ and maturin (only needed for Python bindings)
-brew install python          # macOS; use apt/dnf on Linux
-pip install maturin
-```
-
-### 2. Clone and branch
-
-```bash
-git clone https://github.com/vectordb/vectordb.git
-cd vectordb
-git checkout -b feat/my-change origin/main   # or an existing branch
-```
-
-### 3. Python virtual environment
-
-Skip if you only need the Rust server/CLI.
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
-pip install maturin
-```
-
-### 4. Build
-
-```bash
-# Rust (server + CLI)
-cargo build
-
-# Python bindings (venv must be active)
-maturin develop
-python3 -c "import vectordb; print('OK')"   # verify
-```
-
-> **macOS:** if `cargo build` fails with undefined Python symbols, see
-> [Building on macOS](#building-on-macos).
-
-### 5. Test and run
-
-```bash
-cargo test                                   # run all tests
-RUST_LOG=debug cargo run -p vectordb-server  # start dev server
-./target/debug/vdb list                      # use the CLI
-```
-
-### Project structure
-
-```
-crates/
-├── vectordb-core/     # index trait, FlatIndex, HnswIndex
-├── vectordb-server/   # Axum HTTP server
-├── vectordb-cli/      # vdb CLI binary
-└── vectordb-python/   # PyO3 Python bindings
+```python
+db  = quiver.Client(path="./my_quiver_data")
+col = db.get_collection("sentences")
+hits = col.search(query=[...], k=5)
 ```
 
 ---
 
-## REST API
+### In-memory storage — low-level indexes
 
-All requests and responses use `application/json`.
+`FlatIndex` and `HnswIndex` live entirely in RAM. Nothing is written to disk
+unless you call `.save()`. Ideal for ephemeral workloads, unit tests, or
+pipelines that build a fresh index each run.
 
-### Collections
+```python
+import quiver
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/collections` | List all collections |
-| `POST` | `/collections/:name` | Create a collection |
-| `GET` | `/collections/:name` | Get collection info |
-| `DELETE` | `/collections/:name` | Delete a collection |
+# ── FlatIndex — exact brute-force, 100% recall ────────────────────────────────
+idx = quiver.FlatIndex(dimensions=3, metric="l2")
+idx.add(id=1, vector=[1.0, 0.0, 0.0])
+idx.add(id=2, vector=[0.0, 1.0, 0.0])
+idx.add_batch([(3, [0.5, 0.5, 0.0]), (4, [0.1, 0.9, 0.0])])
 
-**Create collection body:**
-```json
-{
-  "dimensions": 1536,
-  "metric": "cosine",
-  "index_type": "hnsw",
-  "hnsw": {
-    "ef_construction": 200,
-    "ef_search": 50,
-    "m": 12
-  }
+results = idx.search(query=[0.9, 0.1, 0.0], k=2)
+for r in results:
+    print(f"id={r['id']}  dist={r['distance']:.4f}")
+
+print(len(idx))        # 4
+print(idx.dimensions)  # 3
+print(idx.metric)      # "l2"
+
+idx.delete(id=3)
+
+# Optional: save to disk and reload later.
+idx.save("./flat_index.bin")
+loaded = quiver.FlatIndex.load("./flat_index.bin")
+
+# ── HnswIndex — approximate nearest-neighbour, fast queries ──────────────────
+hnsw = quiver.HnswIndex(
+    dimensions=384,
+    metric="cosine",
+    ef_construction=200,   # beam width during graph build (higher = better recall, slower build)
+    ef_search=50,          # beam width at query time (higher = better recall, slower query)
+    m=12,                  # graph edges per node (higher = better recall, more RAM)
+)
+
+for vid, vec in my_vectors:
+    hnsw.add(id=vid, vector=vec)
+
+hnsw.flush()   # build the HNSW graph after bulk inserts
+
+results = hnsw.search(query=query_vec, k=10)
+
+# Optional: persist and reload.
+hnsw.save("./hnsw_index.bin")
+loaded = quiver.HnswIndex.load("./hnsw_index.bin")
+```
+
+---
+
+### Payload metadata
+
+Each vector can carry an arbitrary JSON-serialisable `dict` as metadata.
+Payloads are stored alongside the vector and returned with every search result.
+
+> **Note:** Payloads are only available through `Client` / `Collection`.
+> The low-level `FlatIndex` and `HnswIndex` objects store vectors only.
+
+```python
+import quiver
+
+db  = quiver.Client(path="./data")
+col = db.create_collection("articles", dimensions=1536, metric="cosine")
+
+col.upsert(id=1, vector=embedding_1, payload={
+    "title":    "Introduction to Rust",
+    "author":   "Jane Smith",
+    "category": "programming",
+    "score":    4.8,
+})
+col.upsert(id=2, vector=embedding_2, payload={
+    "title":    "Vector Databases Explained",
+    "author":   "Bob Jones",
+    "category": "databases",
+    "score":    4.5,
+})
+
+hits = col.search(query=query_embedding, k=3)
+for hit in hits:
+    print(f"{hit['id']} — {hit['payload']['title']} (dist={hit['distance']:.4f})")
+```
+
+---
+
+### Filtered search
+
+Pass a `filter` dict to `search()` to restrict results to vectors whose
+payload matches the condition. Filters are applied before ranking.
+
+**Supported operators:** `$eq`, `$ne`, `$in`, `$gt`, `$gte`, `$lt`, `$lte`,
+`$and`, `$or`. Dot-notation accesses nested fields (`"meta.author"`).
+
+```python
+col = db.get_collection("articles")
+
+# Equality
+hits = col.search(query=query_embedding, k=5,
+    filter={"category": {"$eq": "programming"}})
+
+# Exclusion
+hits = col.search(query=query_embedding, k=5,
+    filter={"category": {"$ne": "spam"}})
+
+# Set membership
+hits = col.search(query=query_embedding, k=5,
+    filter={"category": {"$in": ["programming", "databases"]}})
+
+# Numeric range
+hits = col.search(query=query_embedding, k=5,
+    filter={"score": {"$gte": 4.5}})
+
+# AND — all conditions must match
+hits = col.search(query=query_embedding, k=5,
+    filter={
+        "$and": [
+            {"category": {"$eq": "programming"}},
+            {"score":    {"$gte": 4.0}},
+        ]
+    })
+
+# OR — at least one condition must match
+hits = col.search(query=query_embedding, k=5,
+    filter={
+        "$or": [
+            {"category": {"$eq": "programming"}},
+            {"category": {"$eq": "databases"}},
+        ]
+    })
+
+# Nested field via dot notation
+hits = col.search(query=query_embedding, k=5,
+    filter={"meta.author": {"$eq": "Jane Smith"}})
+```
+
+---
+
+### Index types
+
+`Client.create_collection` supports two index types:
+
+| `index_type` | Recall | Best for |
+|---|---|---|
+| `"hnsw"` (default) | 95–99% | General purpose, any dataset size |
+| `"flat"` | 100% exact | Small datasets or when exact recall is required |
+
+HNSW uses sensible defaults (`ef_construction=200`, `ef_search=50`, `m=12`).
+To tune HNSW parameters directly, use the in-memory `HnswIndex` and manage
+persistence with `.save()` / `.load()`.
+
+```python
+db = quiver.Client(path="./data")
+
+# HNSW — approximate, fast (default)
+col = db.create_collection("ann", dimensions=768, metric="cosine", index_type="hnsw")
+
+# Flat — exact brute-force
+col = db.create_collection("exact", dimensions=768, metric="cosine", index_type="flat")
+```
+
+---
+
+### Collection management
+
+```python
+db = quiver.Client(path="./data")
+
+# Create only if it doesn't exist yet (idempotent, uses HNSW).
+col = db.get_or_create_collection("docs", dimensions=768, metric="cosine")
+
+# Get a handle to an existing collection.
+col = db.get_collection("docs")
+
+# List all collection names.
+print(db.list_collections())   # ['docs', 'articles', ...]
+
+# Count vectors.
+print(col.count)               # 1024
+
+# Upsert = insert or overwrite by ID.
+col.upsert(id=42, vector=new_vec, payload={"updated": True})
+
+# Delete a single vector by ID.
+col.delete(id=42)
+
+# Drop an entire collection and remove all data from disk.
+db.delete_collection("docs")
+```
+
+---
+
+### Real-world example
+
+Semantic search over documents using `sentence-transformers`:
+
+```python
+import quiver
+from sentence_transformers import SentenceTransformer
+
+model = SentenceTransformer("all-MiniLM-L6-v2")  # 384-dim embeddings
+
+docs = [
+    {"id": 1, "text": "Rust is a systems programming language focused on safety."},
+    {"id": 2, "text": "Python is great for data science and machine learning."},
+    {"id": 3, "text": "Vector databases store embeddings for similarity search."},
+    {"id": 4, "text": "HNSW is a graph-based approximate nearest neighbour algorithm."},
+]
+
+db  = quiver.Client(path="./semantic_data")
+col = db.get_or_create_collection("docs", dimensions=384, metric="cosine")
+
+for doc in docs:
+    vec = model.encode(doc["text"]).tolist()
+    col.upsert(id=doc["id"], vector=vec, payload={"text": doc["text"]})
+
+# Similarity search
+query_vec = model.encode("how do embeddings work?").tolist()
+hits = col.search(query=query_vec, k=3)
+for hit in hits:
+    print(f"  [{hit['distance']:.4f}] {hit['payload']['text']}")
+
+# Filtered search
+hits = col.search(
+    query=query_vec,
+    k=3,
+    filter={"$or": [
+        {"text": {"$eq": "Rust is a systems programming language focused on safety."}},
+        {"text": {"$eq": "Python is great for data science and machine learning."}},
+    ]}
+)
+```
+
+---
+
+## Rust library
+
+`quiver-core` is a pure Rust library — no async runtime, no network dependencies.
+
+```toml
+[dependencies]
+quiver-core = { path = "./crates/quiver-core" }
+serde_json   = "1"
+```
+
+### Persistent storage (Rust)
+
+```rust
+use quiver_core::db::Quiver;
+use quiver_core::distance::Metric;
+use quiver_core::payload::FilterCondition;
+use serde_json::json;
+
+let mut db = Quiver::open("./my_quiver_data")?;
+
+db.create_collection("sentences", 384, Metric::Cosine)?;
+db.upsert("sentences", 1, &[0.12, 0.45, /* ... */], None)?;
+db.upsert("sentences", 2, &[0.98, 0.01, /* ... */], None)?;
+
+let hits = db.search("sentences", &[0.13, 0.44, /* ... */], 5)?;
+for hit in &hits {
+    println!("id={:4}  distance={:.6}", hit.id, hit.distance);
 }
+
+// Filtered search
+let filter: FilterCondition = serde_json::from_value(json!({
+    "$and": [
+        { "category": { "$eq": "programming" } },
+        { "score":    { "$gte": 4.0 } }
+    ]
+}))?;
+let hits = db.search_filtered("articles", &query, 5, &filter)?;
+
+// Collection management
+db.get_or_create_collection("docs", 768, Metric::Cosine)?;
+let names = db.list_collections();
+let n     = db.count("docs")?;
+db.delete("docs", 42)?;
+db.delete_collection("docs")?;
 ```
 
-`metric`: `"l2"` | `"cosine"` | `"dot_product"`
-`index_type`: `"flat"` | `"hnsw"` (default: `"hnsw"`)
+### In-memory storage (Rust)
 
-### Vectors
+Use the index types directly. No WAL, no directory — nothing hits disk
+unless you call `.save()`.
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/collections/:name/vectors` | Upsert a vector |
-| `POST` | `/collections/:name/search` | kNN search |
-| `DELETE` | `/collections/:name/vectors/:id` | Delete a vector |
+```rust
+use quiver_core::index::flat::FlatIndex;
+use quiver_core::index::hnsw::{HnswConfig, HnswIndex};
+use quiver_core::index::VectorIndex;
+use quiver_core::distance::Metric;
 
-**Upsert body:**
-```json
-{ "id": 42, "vector": [0.1, 0.2, 0.3, ...] }
-```
+// ── FlatIndex (exact, 100% recall) ────────────────────────────────────────────
+let mut flat = FlatIndex::new(3, Metric::L2);
+flat.add(1, &[1.0, 0.0, 0.0])?;
+flat.add(2, &[0.0, 1.0, 0.0])?;
+flat.add_batch(&[(3, vec![0.5, 0.5, 0.0])])?;
 
-**Search body:**
-```json
-{ "vector": [0.1, 0.2, 0.3, ...], "k": 10 }
-```
+let results = flat.search(&[0.9, 0.1, 0.0], 2)?;
+flat.save("./flat.bin")?;
+let loaded = FlatIndex::load("./flat.bin")?;
 
-**Search response:**
-```json
-{
-  "results": [
-    { "id": 7,  "distance": 0.012 },
-    { "id": 99, "distance": 0.034 }
-  ]
+// ── HnswIndex (approximate, fast) ─────────────────────────────────────────────
+let cfg = HnswConfig { ef_construction: 200, ef_search: 50, m: 12 };
+let mut hnsw = HnswIndex::new(384, Metric::Cosine, cfg);
+
+for (id, vec) in &my_vectors {
+    hnsw.add(*id, vec)?;
 }
+hnsw.flush();             // build graph after bulk insert
+hnsw.set_ef_search(100);  // tune recall at query time without rebuilding
+
+let results = hnsw.search(&query, 10)?;
+hnsw.save("./hnsw.bin")?;
+let loaded = HnswIndex::load("./hnsw.bin")?;
+```
+
+### All index types via CollectionManager
+
+`CollectionManager` provides direct access to all six index types. All are
+persistent (WAL-backed). The Python SDK currently exposes `"flat"` and `"hnsw"`
+only; the remaining types are available to Rust users.
+
+```rust
+use quiver_core::manager::CollectionManager;
+use quiver_core::collection::{CollectionMeta, IndexType};
+use quiver_core::distance::Metric;
+use quiver_core::index::hnsw::HnswConfig;
+use quiver_core::index::ivf::IvfConfig;
+
+let mut mgr = CollectionManager::open("./data")?;
+
+// Flat — exact, O(N·D) per query
+mgr.create_collection(CollectionMeta {
+    name: "exact".into(), dimensions: 768, metric: Metric::Cosine,
+    index_type: IndexType::Flat,
+    hnsw_config: None, ivf_config: None, faiss_factory: None,
+    wal_compact_threshold: 50_000,
+    auto_promote_threshold: None, promotion_hnsw_config: None,
+    embedding_model: None,
+})?;
+
+// HNSW — ~95–99% recall, O(log N · ef) per query
+mgr.create_collection(CollectionMeta {
+    name: "ann".into(), dimensions: 768, metric: Metric::Cosine,
+    index_type: IndexType::Hnsw,
+    hnsw_config: Some(HnswConfig { ef_construction: 200, ef_search: 50, m: 12 }),
+    ivf_config: None, faiss_factory: None,
+    wal_compact_threshold: 50_000,
+    auto_promote_threshold: None, promotion_hnsw_config: None,
+    embedding_model: None,
+})?;
+
+// QuantizedFlat — int8 brute-force, ~4× less RAM, ~99% recall vs Flat
+mgr.create_collection(CollectionMeta {
+    name: "quantized".into(), dimensions: 1536, metric: Metric::Cosine,
+    index_type: IndexType::QuantizedFlat,
+    hnsw_config: None, ivf_config: None, faiss_factory: None,
+    wal_compact_threshold: 50_000,
+    auto_promote_threshold: None, promotion_hnsw_config: None,
+    embedding_model: None,
+})?;
+
+// IVF — cluster-based ANN; auto-trains after train_size inserts
+// Rule of thumb: n_lists = sqrt(N), nprobe = sqrt(n_lists)
+mgr.create_collection(CollectionMeta {
+    name: "ivf".into(), dimensions: 768, metric: Metric::L2,
+    index_type: IndexType::Ivf,
+    ivf_config: Some(IvfConfig { n_lists: 256, nprobe: 16, train_size: 4096, max_iter: 25 }),
+    hnsw_config: None, faiss_factory: None,
+    wal_compact_threshold: 50_000,
+    auto_promote_threshold: None, promotion_hnsw_config: None,
+    embedding_model: None,
+})?;
+
+// MmapFlat — disk-mapped brute-force; near-zero RAM; OS pages in as needed
+mgr.create_collection(CollectionMeta {
+    name: "mmap".into(), dimensions: 768, metric: Metric::Cosine,
+    index_type: IndexType::MmapFlat,
+    hnsw_config: None, ivf_config: None, faiss_factory: None,
+    wal_compact_threshold: 50_000,
+    auto_promote_threshold: None, promotion_hnsw_config: None,
+    embedding_model: None,
+})?;
+
+// FAISS — requires `--features faiss` and libfaiss_c
+// Factory strings: "Flat", "IVF1024,Flat", "IVF256,PQ64", "HNSW32"
+#[cfg(feature = "faiss")]
+mgr.create_collection(CollectionMeta {
+    name: "faiss_ivf".into(), dimensions: 768, metric: Metric::L2,
+    index_type: IndexType::Faiss,
+    faiss_factory: Some("IVF1024,Flat".into()),
+    hnsw_config: None, ivf_config: None,
+    wal_compact_threshold: 50_000,
+    auto_promote_threshold: None, promotion_hnsw_config: None,
+    embedding_model: None,
+})?;
+
+// Auto-promote: start exact, automatically switch to HNSW at threshold
+mgr.create_collection(CollectionMeta {
+    name: "auto".into(), dimensions: 768, metric: Metric::Cosine,
+    index_type: IndexType::Flat,
+    auto_promote_threshold: Some(10_000),
+    promotion_hnsw_config:  Some(HnswConfig::default()),
+    hnsw_config: None, ivf_config: None, faiss_factory: None,
+    wal_compact_threshold: 50_000,
+    embedding_model: None,
+})?;
 ```
 
 ---
 
-## CLI
+## Distance metrics
 
-`vdb` is the command-line client for a running `vectordb-server`.
+| Metric | Rust | Python | Use when |
+|--------|------|--------|----------|
+| Cosine | `Metric::Cosine` | `"cosine"` | Text/image embeddings (most common) |
+| Euclidean (L2) | `Metric::L2` | `"l2"` | Geometry, sensor data, unnormalised vectors |
+| Dot product | `Metric::DotProduct` | `"dot_product"` | Pre-normalised vectors, recommendation models |
 
-### Build and install
-
-```bash
-cargo build --release
-# binary lands at target/release/vdb
-```
-
-Add `target/release` to your `$PATH`, or run it as `./target/release/vdb`.
-
-### Server URL
-
-By default `vdb` connects to `http://localhost:8080`. Override with `--host` or the `VDB_HOST` environment variable:
-
-```bash
-vdb --host http://prod-server:8080 list
-VDB_HOST=http://prod-server:8080 vdb list
-```
-
-### Commands
-
-#### `vdb list`
-List all collections.
-```bash
-vdb list
-```
-
-#### `vdb create <name>`
-Create a new collection.
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--dimensions <N>` | *(required)* | Number of dimensions |
-| `--metric <m>` | `cosine` | `l2` \| `cosine` \| `dot_product` |
-| `--index <type>` | `hnsw` | `flat` \| `hnsw` |
-
-```bash
-vdb create my-docs --dimensions 768
-vdb create my-docs --dimensions 768 --metric cosine --index hnsw
-vdb create exact-idx --dimensions 128 --metric l2 --index flat
-```
-
-#### `vdb insert <collection>`
-Insert or update a vector (comma-separated floats).
-
-```bash
-vdb insert my-docs --id 1 --vector "0.1,0.2,0.3"
-vdb insert my-docs --id 42 --vector "0.9,0.1,0.5,0.3"
-```
-
-#### `vdb search <collection>`
-Search for nearest neighbours. Prints JSON results.
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--vector <floats>` | *(required)* | Comma-separated query vector |
-| `--k <N>` | `5` | Number of neighbours to return |
-
-```bash
-vdb search my-docs --vector "0.1,0.2,0.3"
-vdb search my-docs --vector "0.1,0.2,0.3" --k 10
-```
-
-Output:
-```json
-{
-  "results": [
-    { "id": 1,  "distance": 0.0 },
-    { "id": 99, "distance": 0.042 }
-  ]
-}
-```
-
-#### `vdb delete <collection>`
-Delete a single vector by ID.
-```bash
-vdb delete my-docs --id 42
-```
-
-#### `vdb drop <collection>`
-Delete an entire collection.
-```bash
-vdb drop my-docs
-```
-
-### End-to-end example
-
-```bash
-# Start the server
-./target/release/vectordb-server &
-
-# Create a 3-dimensional collection
-vdb create colours --dimensions 3 --metric l2 --index flat
-
-# Insert some vectors
-vdb insert colours --id 1 --vector "1.0,0.0,0.0"   # red
-vdb insert colours --id 2 --vector "0.0,1.0,0.0"   # green
-vdb insert colours --id 3 --vector "0.0,0.0,1.0"   # blue
-
-# Search for the 2 closest to "mostly red"
-vdb search colours --vector "0.9,0.1,0.0" --k 2
-
-# Remove a vector and the collection
-vdb delete colours --id 3
-vdb drop colours
-```
+> Most embedding models output cosine-space vectors. Use `"cosine"` unless your
+> model documentation says otherwise.
 
 ---
 
-## Index Types
+## Index type reference
 
-| Index | Recall | Query complexity | Build complexity | Use when |
-|-------|--------|------------------|------------------|----------|
-| `flat` | 100% | O(N · D) | O(N) | < 100 K vectors, ground-truth eval |
-| `hnsw` | ~95–99% (tunable) | O(log N · ef) | O(N · M · log N) | > 100 K vectors, latency-sensitive |
+### Python SDK
 
-Both index types support disk persistence via `save` / `load` (JSON format). For `HnswIndex`, the graph is not stored — it is rebuilt automatically on load, so the loaded index is immediately ready for ANN search.
+| API | Index | Storage | Recall | Notes |
+|-----|-------|---------|--------|-------|
+| `create_collection(..., index_type="hnsw")` | HNSW | Persistent (WAL) | 95–99% | Default; fast approximate search |
+| `create_collection(..., index_type="flat")` | Flat | Persistent (WAL) | 100% | Exact; slower on large datasets |
+| `FlatIndex(...)` | Flat | **In-memory** | 100% | No WAL; optional `.save()` / `.load()` |
+| `HnswIndex(...)` | HNSW | **In-memory** | 95–99% | Configurable; optional `.save()` / `.load()` |
 
-### HNSW tuning
+### Rust (all index types)
+
+| Index | Recall | Query complexity | RAM | Best for |
+|-------|--------|-----------------|-----|----------|
+| Flat | 100% | O(N·D) | All vectors (f32) | <100K vectors, exact required |
+| HNSW | 95–99% | O(log N · ef) | All vectors + graph | General purpose |
+| QuantizedFlat | ~99% | O(N·D) | **~4× less** (int8) | Memory-constrained exact search |
+| IVF | Tunable | O(n\_lists + nprobe·N/n\_lists) | All vectors | Large datasets with training phase |
+| MmapFlat | 100% | O(N·D) disk-paged | Staging only | Dataset larger than RAM |
+| FAISS | Varies | Varies | Varies | GPU, PQ compression, custom factory |
+
+### HNSW parameters
 
 | Parameter | Default | Effect |
 |-----------|---------|--------|
-| `ef_construction` | 200 | Graph quality during build. Higher → better recall, slower build. |
-| `ef_search` | 50 | Beam width at query time. Higher → better recall, slower query. |
-| `m` | 12 | Edges per node. Higher → better recall, more memory. |
+| `ef_construction` | 200 | Build beam width — higher = better recall, slower build |
+| `ef_search` | 50 | Query beam width — tunable at runtime without rebuild |
+| `m` | 12 | Edges per node per layer — higher = better recall, more RAM |
+
+### IVF parameters (Rust only)
+
+| Parameter | Default | Effect |
+|-----------|---------|--------|
+| `n_lists` | 256 | k-means clusters — rule of thumb: `sqrt(N)` |
+| `nprobe` | 16 | Clusters scanned per query — higher = better recall, slower |
+| `train_size` | 4096 | Vectors buffered before training triggers automatically |
+| `max_iter` | 25 | Lloyd's k-means iterations |
 
 ---
 
-## Distance Metrics
+## On-disk layout
 
-| Metric | Formula | Best for |
-|--------|---------|----------|
-| `l2` | `‖a − b‖₂` | Absolute position matters (coordinates, pixel embeddings) |
-| `cosine` | `1 − (a·b) / (‖a‖ ‖b‖)` | Direction matters, magnitude doesn't (NLP embeddings) |
-| `dot_product` | `−(a · b)` | Pre-normalised vectors, max-inner-product search |
+```
+my_quiver_data/
+├── sentences/
+│   ├── meta.json   ← collection config (dimensions, metric, index type)
+│   └── wal.log     ← write-ahead log; replayed on open to rebuild the index
+├── mmap_col/
+│   ├── meta.json
+│   ├── wal.log
+│   └── vectors.mmap   ← memory-mapped vector file (MmapFlat only)
+└── ...
+```
+
+- **`meta.json`** — human-readable collection metadata
+- **`wal.log`** — binary append log (bincode frames); the authoritative record of all writes
+- **`vectors.mmap`** — flat binary vector file for `MmapFlatIndex`
+
+In-memory indexes (`FlatIndex`, `HnswIndex` used directly) write nothing
+unless you explicitly call `.save(path)`.
 
 ---
 
-## Building on macOS
-
-This section covers macOS-specific setup and known issues developers encounter
-when building the project on Apple hardware (both Intel and Apple Silicon).
-
-### Prerequisites
+## Build
 
 ```bash
-# Install Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source ~/.cargo/env
+# Build and test quiver-core
+./dev_build.sh
 
-# Install Python 3.8+ (Homebrew recommended)
-brew install python
-
-# Install maturin (required for the Python bindings crate)
+# Build Python wheel and smoke-test
+python3 -m venv .venv && source .venv/bin/activate
 pip install maturin
-```
+./dev_build.sh --python
 
-### Building the Rust workspace
-
-```bash
-cargo build --release
-```
-
-### Building the Python bindings
-
-The `vectordb-python` crate is a PyO3 extension module and **must be built
-with `maturin`**, not plain `cargo build`:
-
-```bash
-# Dev install into your active virtual environment (fast iteration)
-maturin develop
-
-# Build a release wheel
-maturin build --release
-pip install target/wheels/vectordb-*.whl
-```
-
-### Apple Silicon (M1/M2/M3) — universal wheel
-
-```bash
-rustup target add x86_64-apple-darwin aarch64-apple-darwin
-maturin build --release --target universal2-apple-darwin
+# Build with FAISS support (requires libfaiss_c)
+./dev_build.sh --faiss --python
 ```
 
 ---
 
-### Known issues
+## Crates
 
-#### 1. `cargo build` fails with "Undefined symbols for architecture arm64"
-
-**Symptom:**
-
-```
-Undefined symbols for architecture arm64:
-  "_PyBaseObject_Type", referenced from: ...
-  "_PyBytes_AsString", referenced from: ...
-  ...
-ld: symbol(s) not found for architecture arm64
-```
-
-**Cause:** PyO3 extension modules intentionally leave Python symbols
-(`_Py*`) unresolved at link time. They are resolved at runtime when
-Python loads the `.so`. Plain `cargo build` does not pass the required
-`-undefined dynamic_lookup` linker flag, so the link step fails.
-
-**Fix:** The repository ships a `.cargo/config.toml` that adds this
-flag automatically for both `aarch64-apple-darwin` and
-`x86_64-apple-darwin` targets. If you still see the error, ensure the
-file is present:
-
-```toml
-# .cargo/config.toml
-[target.aarch64-apple-darwin]
-rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
-
-[target.x86_64-apple-darwin]
-rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
-```
-
-> For building the Python extension the correct tool is always
-> `maturin develop` — it sets this flag automatically regardless of
-> `.cargo/config.toml`.
-
----
-
-#### 2. Python not found / wrong Python picked up
-
-**Symptom:** PyO3's build script prints `error: Python version X.Y is
-not supported` or links against the wrong interpreter.
-
-**Fix:** Point PyO3 at your chosen Python explicitly:
-
-```bash
-export PYO3_PYTHON=$(which python3)
-maturin develop
-```
-
----
-
-#### 3. pyenv Python missing shared library
-
-**Symptom:** Linker error referencing `libpythonX.Y.dylib` not found,
-or PyO3 build script warning `could not find Python shared library`.
-
-**Cause:** pyenv builds Python without a shared library by default.
-
-**Fix:** Reinstall Python with shared-library support enabled:
-
-```bash
-PYTHON_CONFIGURE_OPTS="--enable-shared" pyenv install 3.11.9
-pyenv global 3.11.9
-```
-
----
-
-#### 4. `zsh: unknown sort specifier` when running Python commands
-
-**Symptom:** zsh prints `zsh: unknown sort specifier` after certain
-`python3 -c` invocations.
-
-**Cause:** This is a zsh glob-expansion side effect when the Python
-output contains characters zsh tries to interpret. It does not affect
-the build — wrap the command in quotes or run it inside a subshell to
-suppress it.
-
----
-
-#### 5. Build fails after Xcode / Command Line Tools update
-
-**Symptom:** After updating macOS or Xcode, `cargo build` or `maturin`
-fails with linker errors unrelated to Python.
-
-**Fix:** Reinstall the Command Line Tools:
-
-```bash
-sudo xcode-select --reset
-xcode-select --install
-```
-
-Then re-run `rustup show` to confirm the active toolchain is still
-targeting `aarch64-apple-darwin` or `x86_64-apple-darwin` as expected.
-
----
+| Crate | Purpose |
+|-------|---------|
+| `quiver-core` | Embedded vector database engine — indexes, WAL, filtering, distance metrics |
+| `quiver-python` | Python bindings via PyO3/maturin |
 
 ## License
 
-Apache 2.0
+MIT
