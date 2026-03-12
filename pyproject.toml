@@ -22,6 +22,7 @@ classifiers = [
 
 [project.optional-dependencies]
 test = ["pytest", "numpy"]
+benchmark = ["pytest", "numpy", "hnswlib", "faiss-cpu", "chromadb", "usearch"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
