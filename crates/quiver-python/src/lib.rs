@@ -9,6 +9,7 @@ use quiver_core::{
     distance::Metric,
     error::VectorDbError,
     index::{
+        binary_flat::BinaryFlatIndex,
         flat::FlatIndex,
         hnsw::{HnswConfig, HnswIndex},
         ivf::{IvfConfig, IvfIndex},
@@ -56,6 +57,12 @@ fn vec_err_to_py(e: VectorDbError) -> PyErr {
         }
         VectorDbError::NoEmbedder(name) => {
             PyRuntimeError::new_err(format!("no embedder configured for collection '{name}'"))
+        }
+        VectorDbError::SnapshotAlreadyExists(name) => {
+            PyKeyError::new_err(format!("snapshot already exists: {name}"))
+        }
+        VectorDbError::SnapshotNotFound(name) => {
+            PyKeyError::new_err(format!("snapshot not found: {name}"))
         }
     }
 }
@@ -649,6 +656,69 @@ impl PyMmapFlatIndex {
     }
 }
 
+// ── BinaryFlatIndex ──────────────────────────────────────────────────────────
+
+/// Binary (1-bit) quantized brute-force index. 32x less RAM than FlatIndex.
+///
+/// Each f32 component is reduced to 1 bit (positive=1, negative=0).
+/// Distance is computed via Hamming distance (popcount).
+/// Same API as FlatIndex.
+#[pyclass(name = "BinaryFlatIndex")]
+struct PyBinaryFlatIndex {
+    inner: BinaryFlatIndex,
+}
+
+#[pymethods]
+impl PyBinaryFlatIndex {
+    #[new]
+    #[pyo3(signature = (dimensions, metric = "l2"))]
+    fn new(dimensions: usize, metric: &str) -> PyResult<Self> {
+        let m = parse_metric(metric)?;
+        Ok(Self { inner: BinaryFlatIndex::new(dimensions, m) })
+    }
+
+    #[pyo3(signature = (id, vector))]
+    fn add(&mut self, id: u64, vector: Vec<f32>) -> PyResult<()> {
+        self.inner.add(id, &vector).map_err(vec_err_to_py)
+    }
+
+    fn add_batch(&mut self, entries: Vec<(u64, Vec<f32>)>) -> PyResult<()> {
+        self.inner.add_batch(&entries).map_err(vec_err_to_py)
+    }
+
+    fn search(&self, py: Python<'_>, query: Vec<f32>, k: usize) -> PyResult<Vec<PyObject>> {
+        let results = py.allow_threads(|| self.inner.search(&query, k)).map_err(vec_err_to_py)?;
+        results.into_iter().map(|r| {
+            let dict = PyDict::new_bound(py);
+            dict.set_item("id", r.id)?;
+            dict.set_item("distance", r.distance)?;
+            Ok(dict.into())
+        }).collect()
+    }
+
+    fn delete(&mut self, id: u64) -> bool { self.inner.delete(id) }
+    fn __len__(&self) -> usize { self.inner.len() }
+
+    #[getter]
+    fn dimensions(&self) -> usize { self.inner.config().dimensions }
+
+    #[getter]
+    fn metric(&self) -> &'static str { metric_to_str(self.inner.config().metric) }
+
+    fn save(&self, path: &str) -> PyResult<()> { self.inner.save(path).map_err(vec_err_to_py) }
+
+    #[staticmethod]
+    fn load(path: &str) -> PyResult<Self> {
+        let inner = BinaryFlatIndex::load(path).map_err(vec_err_to_py)?;
+        Ok(Self { inner })
+    }
+
+    fn __repr__(&self) -> String {
+        format!("BinaryFlatIndex(dimensions={}, metric=\"{}\", len={})",
+            self.inner.config().dimensions, metric_to_str(self.inner.config().metric), self.inner.len())
+    }
+}
+
 // ── Collection ───────────────────────────────────────────────────────────────
 
 /// A named collection of vectors with WAL-backed persistence.
@@ -802,6 +872,59 @@ impl PyCollection {
     #[getter]
     fn name(&self) -> &str { &self.name }
 
+    /// Create a named snapshot of this collection's current state.
+    fn create_snapshot(&mut self, name: &str) -> PyResult<PyObject> {
+        let col_name = self.name.clone();
+        let mut mgr = self.manager.write().unwrap();
+        let col = mgr.get_collection_mut(&col_name)
+            .ok_or_else(|| PyKeyError::new_err(format!("collection '{col_name}' not found")))?;
+        let meta = col.create_snapshot(name).map_err(vec_err_to_py)?;
+        Python::with_gil(|py| {
+            let dict = PyDict::new_bound(py);
+            dict.set_item("name", &meta.name)?;
+            dict.set_item("created_at", meta.created_at)?;
+            dict.set_item("vector_count", meta.vector_count)?;
+            dict.set_item("sparse_count", meta.sparse_count)?;
+            Ok(dict.into())
+        })
+    }
+
+    /// List all snapshots for this collection, sorted by creation time.
+    fn list_snapshots(&self) -> PyResult<Vec<PyObject>> {
+        let mgr = self.manager.read().unwrap();
+        let col = mgr.get_collection(&self.name)
+            .ok_or_else(|| PyKeyError::new_err(format!("collection '{}' not found", self.name)))?;
+        let snaps = col.list_snapshots().map_err(vec_err_to_py)?;
+        Python::with_gil(|py| {
+            snaps.into_iter().map(|meta| {
+                let dict = PyDict::new_bound(py);
+                dict.set_item("name", &meta.name)?;
+                dict.set_item("created_at", meta.created_at)?;
+                dict.set_item("vector_count", meta.vector_count)?;
+                dict.set_item("sparse_count", meta.sparse_count)?;
+                Ok(dict.into())
+            }).collect()
+        })
+    }
+
+    /// Restore this collection to the state captured by snapshot `name`.
+    fn restore_snapshot(&mut self, name: &str) -> PyResult<()> {
+        let col_name = self.name.clone();
+        let mut mgr = self.manager.write().unwrap();
+        let col = mgr.get_collection_mut(&col_name)
+            .ok_or_else(|| PyKeyError::new_err(format!("collection '{col_name}' not found")))?;
+        col.restore_snapshot(name).map_err(vec_err_to_py)
+    }
+
+    /// Delete a snapshot by name.
+    fn delete_snapshot(&mut self, name: &str) -> PyResult<()> {
+        let col_name = self.name.clone();
+        let mut mgr = self.manager.write().unwrap();
+        let col = mgr.get_collection_mut(&col_name)
+            .ok_or_else(|| PyKeyError::new_err(format!("collection '{col_name}' not found")))?;
+        col.delete_snapshot(name).map_err(vec_err_to_py)
+    }
+
     fn __repr__(&self) -> String {
         let count = self.count();
         format!("Collection(name=\"{}\", count={count})", self.name)
@@ -852,6 +975,7 @@ impl PyClient {
             "ivf" => (IndexType::Ivf, None, Some(IvfConfig::default())),
             "ivf_pq" => (IndexType::IvfPq, None, None),
             "mmap_flat" => (IndexType::MmapFlat, None, None),
+            "binary_flat" => (IndexType::BinaryFlat, None, None),
             other => return Err(PyValueError::new_err(format!("unknown index_type {other:?}"))),
         };
         let ivf_pq_config = if it == IndexType::IvfPq { Some(IvfPqConfig::default()) } else { None };
@@ -909,6 +1033,7 @@ fn quiver_vector_db(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyIvfIndex>()?;
     m.add_class::<PyIvfPqIndex>()?;
     m.add_class::<PyMmapFlatIndex>()?;
+    m.add_class::<PyBinaryFlatIndex>()?;
     m.add_class::<PyClient>()?;
     m.add_class::<PyCollection>()?;
     Ok(())

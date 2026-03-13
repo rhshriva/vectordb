@@ -312,6 +312,35 @@ class MmapFlatIndex:
     def __repr__(self) -> str: ...
 
 
+class BinaryFlatIndex:
+    """Binary (1-bit) quantized brute-force index. 32x less RAM than FlatIndex.
+
+    Each f32 component is reduced to 1 bit (positive=1, negative=0).
+    Distance is computed via Hamming distance (popcount).
+    """
+
+    dimensions: int
+    metric: str
+
+    def __init__(
+        self,
+        dimensions: int,
+        metric: Literal["l2", "cosine", "dot_product"] = "l2",
+    ) -> None: ...
+
+    def add(self, id: int, vector: List[float]) -> None: ...
+    def add_batch(self, entries: List[Tuple[int, List[float]]]) -> None: ...
+    def search(self, query: List[float], k: int) -> List[Dict[str, Any]]: ...
+    def delete(self, id: int) -> bool: ...
+    def save(self, path: str) -> None: ...
+
+    @staticmethod
+    def load(path: str) -> "BinaryFlatIndex": ...
+
+    def __len__(self) -> int: ...
+    def __repr__(self) -> str: ...
+
+
 # ── Collection & Client ───────────────────────────────────────────────────
 
 class Collection:
@@ -411,6 +440,41 @@ class Collection:
         """Delete a vector by ID. Returns True if found and removed."""
         ...
 
+    def create_snapshot(self, name: str) -> Dict[str, Any]:
+        """Create a named snapshot of this collection's current state.
+
+        Returns:
+            Dict with keys ``name``, ``created_at``, ``vector_count``, ``sparse_count``.
+
+        Raises:
+            KeyError: If a snapshot with this name already exists.
+        """
+        ...
+
+    def list_snapshots(self) -> List[Dict[str, Any]]:
+        """List all snapshots, sorted by creation time.
+
+        Returns:
+            List of dicts with keys ``name``, ``created_at``, ``vector_count``, ``sparse_count``.
+        """
+        ...
+
+    def restore_snapshot(self, name: str) -> None:
+        """Restore this collection to the state captured by snapshot ``name``.
+
+        Raises:
+            KeyError: If snapshot does not exist.
+        """
+        ...
+
+    def delete_snapshot(self, name: str) -> None:
+        """Delete a snapshot by name.
+
+        Raises:
+            KeyError: If snapshot does not exist.
+        """
+        ...
+
     def __repr__(self) -> str: ...
 
 
@@ -441,7 +505,7 @@ class Client:
         metric: Literal["cosine", "l2", "dot_product"] = "cosine",
         index_type: Literal[
             "hnsw", "flat", "quantized_flat", "fp16_flat",
-            "ivf", "ivf_pq", "mmap_flat",
+            "ivf", "ivf_pq", "mmap_flat", "binary_flat",
         ] = "hnsw",
     ) -> Collection:
         """Create a new collection.

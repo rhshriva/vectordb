@@ -20,4 +20,4 @@ def random_vector(dim=SAMPLE_DIM, seed=None):
 
 ALL_METRICS = ["cosine", "l2", "dot_product"]
 
-ALL_INDEX_TYPES = ["flat", "hnsw", "quantized_flat", "fp16_flat", "ivf", "ivf_pq", "mmap_flat"]
+ALL_INDEX_TYPES = ["flat", "hnsw", "quantized_flat", "fp16_flat", "ivf", "ivf_pq", "mmap_flat", "binary_flat"]

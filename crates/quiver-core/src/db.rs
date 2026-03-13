@@ -30,7 +30,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::{
-    collection::{CollectionMeta, CollectionSearchResult, IndexType},
+    collection::{CollectionMeta, CollectionSearchResult, IndexType, SnapshotMeta},
     distance::Metric,
     embedder::TextEmbedder,
     error::VectorDbError,
@@ -206,6 +206,51 @@ impl Quiver {
         let col = self.manager.get_collection_mut(collection)
             .ok_or_else(|| VectorDbError::CollectionNotFound(collection.to_string()))?;
         col.upsert_text(id, text, payload)
+    }
+
+    // ── Snapshots ─────────────────────────────────────────────────────────────
+
+    /// Create a named snapshot of `collection`'s current state.
+    pub fn create_snapshot(
+        &mut self,
+        collection: &str,
+        name: &str,
+    ) -> Result<SnapshotMeta, VectorDbError> {
+        let col = self.manager.get_collection_mut(collection)
+            .ok_or_else(|| VectorDbError::CollectionNotFound(collection.to_string()))?;
+        col.create_snapshot(name)
+    }
+
+    /// List all snapshots for `collection`, sorted by creation time.
+    pub fn list_snapshots(
+        &self,
+        collection: &str,
+    ) -> Result<Vec<SnapshotMeta>, VectorDbError> {
+        let col = self.manager.get_collection(collection)
+            .ok_or_else(|| VectorDbError::CollectionNotFound(collection.to_string()))?;
+        col.list_snapshots()
+    }
+
+    /// Restore `collection` to the state captured by snapshot `name`.
+    pub fn restore_snapshot(
+        &mut self,
+        collection: &str,
+        name: &str,
+    ) -> Result<(), VectorDbError> {
+        let col = self.manager.get_collection_mut(collection)
+            .ok_or_else(|| VectorDbError::CollectionNotFound(collection.to_string()))?;
+        col.restore_snapshot(name)
+    }
+
+    /// Delete a snapshot by name.
+    pub fn delete_snapshot(
+        &mut self,
+        collection: &str,
+        name: &str,
+    ) -> Result<(), VectorDbError> {
+        let col = self.manager.get_collection_mut(collection)
+            .ok_or_else(|| VectorDbError::CollectionNotFound(collection.to_string()))?;
+        col.delete_snapshot(name)
     }
 
     /// Embed `text` using the collection's attached embedder, then return the

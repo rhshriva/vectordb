@@ -10,6 +10,7 @@ use crate::{
     embedder::TextEmbedder,
     error::VectorDbError,
     index::{
+        binary_flat::BinaryFlatIndex,
         flat::FlatIndex,
         hnsw::{HnswConfig, HnswIndex},
         ivf::{IvfConfig, IvfIndex},
@@ -50,6 +51,9 @@ pub enum IndexType {
     /// Memory-mapped flat index — vectors live on disk, accessed via mmap.
     /// Keeps RAM usage near zero for large collections.
     MmapFlat,
+    /// Binary (1-bit) quantized brute-force index.
+    /// 32× lower memory than `Flat`. Uses Hamming distance for search.
+    BinaryFlat,
     /// FAISS index created via the factory string (e.g. `"Flat"`, `"IVF1024,Flat"`).
     /// Requires the crate to be compiled with the `faiss` feature.
     Faiss,
@@ -624,6 +628,164 @@ impl Collection {
 
         Ok(())
     }
+
+    // ── Snapshot methods ──────────────────────────────────────────────────────
+
+    /// Create a named snapshot of the current collection state.
+    ///
+    /// The snapshot contains a compacted WAL with only live entries, a copy of
+    /// the collection metadata, and the sparse index (if non-empty).  The
+    /// in-memory index is not snapshotted — it is rebuilt from the WAL on
+    /// restore.
+    pub fn create_snapshot(&self, name: &str) -> Result<SnapshotMeta, VectorDbError> {
+        if name.is_empty()
+            || name.contains('/')
+            || name.contains('\\')
+            || name.contains("..")
+        {
+            return Err(VectorDbError::InvalidConfig(format!(
+                "invalid snapshot name: {name:?}"
+            )));
+        }
+
+        let snap_dir = self.dir.join("snapshots").join(name);
+        if snap_dir.exists() {
+            return Err(VectorDbError::SnapshotAlreadyExists(name.to_string()));
+        }
+        std::fs::create_dir_all(&snap_dir)?;
+
+        // Copy meta.json
+        std::fs::copy(self.dir.join("meta.json"), snap_dir.join("meta.json"))?;
+
+        // Write compacted WAL with live entries
+        let live: Vec<WalEntry> = self
+            .index
+            .iter_vectors()
+            .map(|(id, vector)| WalEntry::Add {
+                id,
+                vector,
+                payload_bytes: self
+                    .payloads
+                    .get(&id)
+                    .map(|p| serde_json::to_vec(p).unwrap_or_default()),
+                sparse_bytes: self
+                    .sparse_index
+                    .get(id)
+                    .map(|sv| bincode::serialize(sv).unwrap_or_default()),
+            })
+            .collect();
+
+        let vector_count = live.len();
+        Wal::compact(snap_dir.join("wal.log"), live.into_iter())?;
+
+        // Copy sparse index if non-empty
+        let sparse_count = self.sparse_index.len();
+        if !self.sparse_index.is_empty() {
+            self.sparse_index.save(snap_dir.join("sparse.bin"))?;
+        }
+
+        // Write snapshot metadata
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let meta = SnapshotMeta {
+            name: name.to_string(),
+            created_at,
+            vector_count,
+            sparse_count,
+        };
+        let meta_bytes = serde_json::to_vec_pretty(&meta)?;
+        std::fs::write(snap_dir.join("snapshot.json"), &meta_bytes)?;
+
+        Ok(meta)
+    }
+
+    /// List all snapshots for this collection, sorted by creation time.
+    pub fn list_snapshots(&self) -> Result<Vec<SnapshotMeta>, VectorDbError> {
+        let snap_base = self.dir.join("snapshots");
+        if !snap_base.exists() {
+            return Ok(vec![]);
+        }
+        let mut snapshots = Vec::new();
+        for entry in std::fs::read_dir(&snap_base)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let meta_path = path.join("snapshot.json");
+            if !meta_path.exists() {
+                continue;
+            }
+            let bytes = std::fs::read(&meta_path)?;
+            if let Ok(meta) = serde_json::from_slice::<SnapshotMeta>(&bytes) {
+                snapshots.push(meta);
+            }
+        }
+        snapshots.sort_by_key(|s| s.created_at);
+        Ok(snapshots)
+    }
+
+    /// Restore this collection to a previously saved snapshot.
+    ///
+    /// Overwrites the current WAL, metadata, and sparse index with the
+    /// snapshot's copies, then reloads the entire collection from disk.
+    pub fn restore_snapshot(&mut self, name: &str) -> Result<(), VectorDbError> {
+        let snap_dir = self.dir.join("snapshots").join(name);
+        if !snap_dir.exists() {
+            return Err(VectorDbError::SnapshotNotFound(name.to_string()));
+        }
+
+        // Overwrite current files with snapshot files
+        std::fs::copy(snap_dir.join("wal.log"), self.dir.join("wal.log"))?;
+        std::fs::copy(snap_dir.join("meta.json"), self.dir.join("meta.json"))?;
+
+        // Handle sparse.bin
+        let snap_sparse = snap_dir.join("sparse.bin");
+        let cur_sparse = self.dir.join("sparse.bin");
+        if snap_sparse.exists() {
+            std::fs::copy(&snap_sparse, &cur_sparse)?;
+        } else if cur_sparse.exists() {
+            std::fs::remove_file(&cur_sparse)?;
+        }
+
+        // Remove stale HNSW graph (it will be rebuilt from WAL on load)
+        let graph_path = self.dir.join("hnsw.graph");
+        if graph_path.exists() {
+            std::fs::remove_file(&graph_path)?;
+        }
+
+        // Reload the collection from the restored files
+        let dir = self.dir.clone();
+        *self = Collection::load(&dir)?;
+
+        Ok(())
+    }
+
+    /// Delete a snapshot by name.
+    pub fn delete_snapshot(&self, name: &str) -> Result<(), VectorDbError> {
+        let snap_dir = self.dir.join("snapshots").join(name);
+        if !snap_dir.exists() {
+            return Err(VectorDbError::SnapshotNotFound(name.to_string()));
+        }
+        std::fs::remove_dir_all(&snap_dir)?;
+        Ok(())
+    }
+}
+
+/// Metadata for a collection snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotMeta {
+    /// User-provided snapshot name.
+    pub name: String,
+    /// Unix timestamp (seconds since epoch) when the snapshot was created.
+    pub created_at: u64,
+    /// Number of vectors in the collection at snapshot time.
+    pub vector_count: usize,
+    /// Number of sparse vectors at snapshot time.
+    pub sparse_count: usize,
 }
 
 fn build_index(meta: &CollectionMeta, dir: &Path) -> Box<dyn VectorIndex> {
@@ -631,6 +793,7 @@ fn build_index(meta: &CollectionMeta, dir: &Path) -> Box<dyn VectorIndex> {
         IndexType::Flat => Box::new(FlatIndex::new(meta.dimensions, meta.metric)),
         IndexType::QuantizedFlat => Box::new(QuantizedFlatIndex::new(meta.dimensions, meta.metric)),
         IndexType::Fp16Flat => Box::new(Fp16FlatIndex::new(meta.dimensions, meta.metric)),
+        IndexType::BinaryFlat => Box::new(BinaryFlatIndex::new(meta.dimensions, meta.metric)),
         IndexType::Hnsw => {
             let cfg = meta.hnsw_config.clone().unwrap_or_default();
             Box::new(HnswIndex::new(meta.dimensions, meta.metric, cfg))

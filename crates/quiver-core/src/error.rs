@@ -41,6 +41,12 @@ pub enum VectorDbError {
     /// has been attached to the collection via `set_embedder`.
     #[error("no embedder configured for collection '{0}'; call set_embedder first")]
     NoEmbedder(String),
+
+    #[error("snapshot already exists: {0}")]
+    SnapshotAlreadyExists(String),
+
+    #[error("snapshot not found: {0}")]
+    SnapshotNotFound(String),
 }
 
 impl From<serde_json::Error> for VectorDbError {
