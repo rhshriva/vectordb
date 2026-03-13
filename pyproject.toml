@@ -31,3 +31,4 @@ testpaths = ["tests"]
 manifest-path = "crates/quiver-python/Cargo.toml"
 module-name = "quiver_vector_db"
 features = ["pyo3/extension-module"]
+python-source = "."
