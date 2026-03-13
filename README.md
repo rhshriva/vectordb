@@ -1,7 +1,17 @@
 # Quiver
 
-An embedded vector database written in Rust with a Python SDK.
-No server, no network — runs fully in-process.
+A fast, embedded vector database written in Rust with a Python SDK.
+No server, no network — runs fully in-process with SIMD-accelerated search.
+
+## Features
+
+- **7 index types** — HNSW, Flat, Int8/FP16 quantized, IVF, IVF-PQ, memory-mapped
+- **3 distance metrics** — Cosine, L2, Dot Product with AVX2/NEON SIMD
+- **Hybrid search** — combine dense vectors with sparse keyword signals (BM25/SPLADE)
+- **Payload filtering** — JSON metadata with operators: `$eq`, `$ne`, `$in`, `$gt`, `$gte`, `$lt`, `$lte`, `$and`, `$or`
+- **WAL persistence** — crash-safe writes, automatic compaction
+- **Type stubs included** — full IDE autocompletion in VSCode, PyCharm, etc.
+- **Zero dependencies** — single pip install, no servers or runtimes
 
 ## Installation
 
@@ -9,16 +19,11 @@ No server, no network — runs fully in-process.
 pip install quiver-vector-db
 ```
 
-Prebuilt wheels are available for:
-- macOS (Apple Silicon / Intel)
-- Linux (x86_64 / ARM64)
-
-Python 3.8+ required.
+Prebuilt wheels for macOS (Apple Silicon / Intel) and Linux (x86_64 / ARM64). Python 3.8+.
 
 **Build from source** (requires Rust toolchain):
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
 pip install maturin
 maturin develop --release -m crates/quiver-python/Cargo.toml
 ```
@@ -51,7 +56,7 @@ Persistent vector database client. Opens a directory on disk; all writes are WAL
 
 | Method | Description |
 |--------|-------------|
-| `create_collection(name, dimensions, metric="cosine", index_type="hnsw")` | Create a new collection. `index_type`: `"hnsw"`, `"flat"`, `"quantized_flat"`, `"fp16_flat"`, `"ivf"`, `"ivf_pq"`, `"mmap_flat"` |
+| `create_collection(name, dimensions, metric="cosine", index_type="hnsw")` | Create a new collection |
 | `get_collection(name)` | Get an existing collection. Raises `KeyError` if not found |
 | `get_or_create_collection(name, dimensions, metric="cosine")` | Get or create (defaults to HNSW) |
 | `delete_collection(name)` | Delete collection and all its data from disk |
@@ -72,9 +77,9 @@ Returned by `Client.create_collection()` or `Client.get_collection()`.
 | `sparse_count` | Property: number of sparse vectors |
 | `name` | Property: collection name |
 
-### `FlatIndex(dimensions, metric="l2")`
+### Standalone Index Classes
 
-Exact brute-force index. 100% recall, O(N*D) per query.
+All standalone indexes share a common interface:
 
 | Method | Description |
 |--------|-------------|
@@ -82,60 +87,61 @@ Exact brute-force index. 100% recall, O(N*D) per query.
 | `add_batch(entries)` | Add multiple vectors. `entries`: list of `(id, vector)` tuples |
 | `search(query, k)` | Returns `[{"id", "distance"}]` |
 | `delete(id)` | Returns `True` if removed |
-| `save(path)` | Save to binary file |
-| `FlatIndex.load(path)` | Static method: load from binary file |
+| `save(path)` / `Index.load(path)` | Persist and restore |
 | `dimensions` | Property |
 | `metric` | Property |
 | `len(idx)` | Number of vectors |
 
-### `HnswIndex(dimensions, metric="l2", ef_construction=200, ef_search=50, m=12)`
+#### `FlatIndex(dimensions, metric="l2")`
+
+Exact brute-force index. 100% recall, O(N*D) per query.
+
+#### `HnswIndex(dimensions, metric="l2", ef_construction=200, ef_search=50, m=12)`
 
 Graph-based approximate nearest-neighbour index. 95-99% recall.
 
-Same methods as `FlatIndex`, plus:
+| Parameter | Default | Effect |
+|-----------|---------|--------|
+| `ef_construction` | 200 | Build beam width. Higher = better recall, slower build |
+| `ef_search` | 50 | Query beam width. Tunable at runtime |
+| `m` | 12 | Graph edges per node. Higher = better recall, more RAM |
 
-| Method | Description |
-|--------|-------------|
-| `flush()` | Build the HNSW graph. Call after bulk inserts for best performance |
+Additional method: `flush()` — build the HNSW graph after bulk inserts.
 
-**Parameters:**
-- `ef_construction` — build beam width (higher = better recall, slower build)
-- `ef_search` — query beam width (tunable at runtime)
-- `m` — graph edges per node (higher = better recall, more RAM)
+#### `QuantizedFlatIndex(dimensions, metric="l2")`
 
-### `QuantizedFlatIndex(dimensions, metric="l2")`
+Int8 quantized brute-force. ~4x less RAM, ~99% recall.
 
-Int8 quantized brute-force. ~4x less RAM, ~99% recall. Same methods as `FlatIndex`.
+#### `Fp16FlatIndex(dimensions, metric="l2")`
 
-### `Fp16FlatIndex(dimensions, metric="l2")`
+Float16 quantized brute-force. 2x less RAM, >99.5% recall.
 
-Float16 quantized brute-force. 2x less RAM, >99.5% recall. Same methods as `FlatIndex`.
-
-### `IvfIndex(dimensions, metric="l2", n_lists=256, nprobe=16, train_size=4096)`
+#### `IvfIndex(dimensions, metric="l2", n_lists=256, nprobe=16, train_size=4096)`
 
 Cluster-based ANN using k-means. Auto-trains after `train_size` inserts.
 
-Same methods as `FlatIndex`, plus `flush()`.
+| Parameter | Default | Effect |
+|-----------|---------|--------|
+| `n_lists` | 256 | Number of clusters (rule of thumb: `sqrt(N)`) |
+| `nprobe` | 16 | Clusters scanned per query |
+| `train_size` | 4096 | Vectors buffered before auto-training |
 
-**Parameters:**
-- `n_lists` — number of clusters (rule of thumb: `sqrt(N)`)
-- `nprobe` — clusters scanned per query
-- `train_size` — vectors buffered before auto-training
+Additional method: `flush()` — trigger training.
 
-### `IvfPqIndex(dimensions, metric="l2", n_lists=256, nprobe=16, train_size=4096, pq_m=8, pq_k_sub=256)`
+#### `IvfPqIndex(dimensions, metric="l2", n_lists=256, nprobe=16, train_size=4096, pq_m=8, pq_k_sub=256)`
 
-IVF with product quantization. ~96x memory reduction for 1536-dim vectors. Same methods as `IvfIndex`.
+IVF with product quantization. ~96x memory reduction for 1536-dim vectors.
 
-**Additional parameters:**
-- `pq_m` — number of sub-quantizers (must divide `dimensions`)
-- `pq_k_sub` — centroids per sub-quantizer
-- Memory per vector = `pq_m` bytes
+| Parameter | Default | Effect |
+|-----------|---------|--------|
+| `pq_m` | 8 | Sub-quantizers (must divide `dimensions`). Memory per vector = `pq_m` bytes |
+| `pq_k_sub` | 256 | Centroids per sub-quantizer |
 
-### `MmapFlatIndex(dimensions, metric="l2", path="./mmap_index.qvec")`
+Additional method: `flush()` — trigger training.
 
-Memory-mapped brute-force. Near-zero RAM; pages loaded on demand by the OS.
+#### `MmapFlatIndex(dimensions, metric="l2", path="./mmap_index.qvec")`
 
-Same methods as `FlatIndex` (except no `save`/`load` — data is always on disk), plus `flush()`.
+Memory-mapped brute-force. Near-zero RAM; pages loaded on demand by the OS. Additional method: `flush()`.
 
 ---
 
@@ -177,6 +183,8 @@ idx = quiver.MmapFlatIndex(dimensions=384, metric="cosine", path="./vectors.qvec
 | Cosine | `"cosine"` | Text/image embeddings (most common) |
 | L2 | `"l2"` | Geometry, sensor data |
 | Dot product | `"dot_product"` | Pre-normalised vectors |
+
+All metrics use SIMD-accelerated kernels (AVX2+FMA on x86, NEON on ARM).
 
 ## Payload & filtered search
 
@@ -220,6 +228,21 @@ for hit in hits:
 
 Regular `upsert()` and `upsert_hybrid()` can be mixed freely in the same collection.
 
+## Persistence
+
+All data written through `Client` is WAL-backed:
+
+- **Crash-safe** — length-prefixed binary frames; partial writes are safely skipped on recovery
+- **Automatic compaction** — after 50K WAL entries, live state is rewritten and tombstones discarded
+- **Graph snapshots** — HNSW graph structure is saved to skip O(N log N) rebuild on reload
+- **Reopen anytime** — point `Client` at the same directory and all collections are restored
+
+Standalone indexes can be saved/loaded manually with `save(path)` and `Index.load(path)`.
+
+## IDE support
+
+Quiver ships with `py.typed` and `.pyi` type stubs. Autocompletion, type checking, and inline docs work out of the box in VSCode, PyCharm, and any editor that supports PEP 561.
+
 ## Development
 
 ### Prerequisites
@@ -250,7 +273,7 @@ maturin develop --release -m crates/quiver-python/Cargo.toml
 # Rust unit tests (175 tests)
 cargo test --workspace
 
-# Python functional tests (69 tests)
+# Python functional tests
 pytest tests/ -v --ignore=tests/test_perf.py
 
 # Python performance benchmarks (insert throughput, search latency, recall)
