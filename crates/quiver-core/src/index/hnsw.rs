@@ -1,8 +1,12 @@
 /// HNSW (Hierarchical Navigable Small World) approximate nearest-neighbour index.
 ///
-/// Custom incremental implementation based on the Malkov & Yashunin 2016 paper.
-/// Supports true online insertion — each vector is inserted directly into the
-/// graph in O(M·log N) time, with no batch rebuild required.
+/// Optimized incremental implementation based on Malkov & Yashunin 2016.
+///
+/// Performance optimizations over the previous HashMap-based version:
+/// - **Flat Vec storage**: O(1) node access by index, no hash overhead
+/// - **Contiguous vector buffer**: all vectors in one Vec<f32> for cache-friendly distance calc
+/// - **Generation-counter visited**: O(1) reset between searches, no per-search allocation
+/// - **u32 internal IDs**: 8-byte Candidate (was 16), denser neighbor lists
 ///
 /// ## Key parameters
 /// | Parameter         | Default | Effect |
@@ -10,15 +14,11 @@
 /// | `ef_construction` | 200     | Beam width during index build. Higher → better recall, slower build. |
 /// | `ef_search`       | 50      | Beam width during query. Higher → better recall, slower query. |
 /// | `m`               | 12      | Edges per node per layer. Higher → better recall, more memory. |
-///
-/// ## Tradeoffs vs FlatIndex
-/// - FlatIndex: 100% recall, O(N·D) query, trivial updates
-/// - HnswIndex: ~95–99% recall (tunable), O(log N · ef) query, incremental insert
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap};
 use std::cmp::Ordering;
-use std::hash::{BuildHasherDefault, Hasher};
 use std::io::{BufReader, BufWriter};
 use std::path::Path;
+use std::sync::Mutex;
 
 use rand::Rng;
 
@@ -28,38 +28,38 @@ use crate::{
     index::{IndexConfig, SearchResult, VectorIndex},
 };
 
-// ── Fast hasher for u64 keys ────────────────────────────────────────────────
-// Replaces SipHash (designed for DOS resistance) with identity hash for u64.
-// Since our IDs are sequential integers, they distribute well without mixing.
+// ── Serialization snapshots (backward compatibility) ─────────────────────
 
-#[derive(Default)]
-struct IdHasher(u64);
-
-impl Hasher for IdHasher {
-    #[inline]
-    fn finish(&self) -> u64 { self.0 }
-    #[inline]
-    fn write_u64(&mut self, i: u64) { self.0 = i; }
-    #[inline]
-    fn write(&mut self, _bytes: &[u8]) { unreachable!("IdHasher only supports u64") }
-}
-
-type FastHashMap<V> = HashMap<u64, V, BuildHasherDefault<IdHasher>>;
-type FastHashSet = HashSet<u64, BuildHasherDefault<IdHasher>>;
-
-// ── Serialization snapshot (legacy format for migration) ─────────────────────
-
+/// Legacy format (pre-incremental HNSW, with flush_threshold + flat vectors).
 #[derive(serde::Serialize, serde::Deserialize)]
 struct LegacyHnswIndexSnapshot {
     dimensions: usize,
     metric: Metric,
     hnsw_config: HnswConfig,
     flush_threshold: usize,
-    vectors: HashMap<u64, Vec<f32>>,  // uses default hasher for serde compat
+    vectors: HashMap<u64, Vec<f32>>,
 }
 
-// ── New serialization snapshot ───────────────────────────────────────────────
+/// Node in the serializable graph snapshot.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct HnswNodeSnapshot {
+    vector: Vec<f32>,
+    neighbors: Vec<Vec<u64>>,
+    level: usize,
+}
 
+/// Serializable graph snapshot (HashMap-based, serde-compatible).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct HnswGraphSnapshot {
+    nodes: HashMap<u64, HnswNodeSnapshot>,
+    entry_point: Option<u64>,
+    m: usize,
+    m_max0: usize,
+    ef_construction: usize,
+    ml: f64,
+}
+
+/// Top-level index snapshot for save/load.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct HnswIndexSnapshot {
     dimensions: usize,
@@ -89,20 +89,37 @@ impl Default for HnswConfig {
     }
 }
 
-// ── Priority queue helpers ──────────────────────────────────────────────────
+// ── Instrumentation for profiling ───────────────────────────────────────────
 
-/// Element for priority queue: (distance, id). Sorted by distance ascending.
+/// Accumulated timing stats from instrumented insert.
+#[derive(Debug, Default)]
+pub struct InsertStats {
+    pub random_level: std::time::Duration,
+    pub clone_vec: std::time::Duration,
+    pub node_insert: std::time::Duration,
+    pub greedy_descent: std::time::Duration,
+    pub search_layer: std::time::Duration,
+    pub sl_distance: std::time::Duration,
+    pub sl_hash_lookup: std::time::Duration,
+    pub sl_heap_ops: std::time::Duration,
+    pub set_neighbors: std::time::Duration,
+    pub back_edges: std::time::Duration,
+    pub pruning: std::time::Duration,
+}
+
+// ── Priority queue element ──────────────────────────────────────────────
+
+/// Candidate for priority queue. 8 bytes (f32 distance + u32 id).
 #[derive(Clone, Copy, PartialEq)]
 struct Candidate {
     distance: f32,
-    id: u64,
+    id: u32,
 }
 
 impl Eq for Candidate {}
 
 impl Ord for Candidate {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Natural ordering: smallest distance first (for min-heap via reverse)
         self.distance.partial_cmp(&other.distance).unwrap_or(Ordering::Equal)
             .then_with(|| self.id.cmp(&other.id))
     }
@@ -114,54 +131,93 @@ impl PartialOrd for Candidate {
     }
 }
 
-// ── HNSW Graph (core data structures) ───────────────────────────────────────
+// ── Visited tracker (generation-based, O(1) reset) ──────────────────────
 
-/// A single node in the HNSW graph.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-struct HnswNode {
-    /// The vector data.
-    vector: Vec<f32>,
-    /// Neighbors at each layer. neighbors[0] = base layer.
-    /// Base layer allows up to 2*M connections; upper layers allow up to M.
-    neighbors: Vec<Vec<u64>>,
-    /// The maximum layer this node appears in (0-indexed).
-    level: usize,
+/// Tracks which nodes have been visited during a search.
+/// Uses a generation counter to avoid clearing the Vec between searches.
+struct VisitedTracker {
+    marks: Vec<u32>,
+    gen: u32,
 }
 
-/// Serializable snapshot of the HNSW graph (uses default HashMap hasher for serde).
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-struct HnswGraphSnapshot {
-    nodes: HashMap<u64, HnswNode>,
-    entry_point: Option<u64>,
-    m: usize,
-    m_max0: usize,
-    ef_construction: usize,
-    ml: f64,
+impl VisitedTracker {
+    fn new() -> Self {
+        Self { marks: Vec::new(), gen: 1 }
+    }
+
+    fn ensure_capacity(&mut self, n: usize) {
+        if self.marks.len() < n {
+            self.marks.resize(n, 0);
+        }
+    }
+
+    /// Start a new visit epoch. O(1) — just increments a counter.
+    #[inline]
+    fn reset(&mut self) {
+        self.gen = self.gen.wrapping_add(1);
+        if self.gen == 0 {
+            // Overflow (every ~4 billion searches): clear everything
+            self.marks.fill(0);
+            self.gen = 1;
+        }
+    }
+
+    /// Mark id as visited. Returns true if newly visited this epoch.
+    #[inline]
+    fn visit(&mut self, id: u32) -> bool {
+        let idx = id as usize;
+        if self.marks[idx] == self.gen {
+            false
+        } else {
+            self.marks[idx] = self.gen;
+            true
+        }
+    }
 }
 
-/// The HNSW graph supporting incremental insertion.
-/// Uses a fast identity hasher for u64 keys (avoids SipHash overhead).
+// ── HNSW Graph (flat Vec storage) ───────────────────────────────────────
+
+/// The HNSW graph with flat Vec-based storage.
+///
+/// All node data is stored in parallel Vecs indexed by node ID (u32).
+/// Vectors are stored contiguously in a single buffer for cache locality.
 #[derive(Clone, Debug)]
 struct HnswGraph {
-    /// All nodes indexed by their user-provided u64 ID.
-    nodes: FastHashMap<HnswNode>,
-    /// The entry point node ID (the node at the highest layer).
-    entry_point: Option<u64>,
-    /// Maximum number of connections per upper layer (M).
+    /// Flat vector storage: vector for node i at `[i*dim .. (i+1)*dim]`.
+    vectors: Vec<f32>,
+    /// Level per node (max 255 layers).
+    levels: Vec<u8>,
+    /// `neighbors[node_id][layer]` = Vec of neighbor u32 IDs.
+    neighbors: Vec<Vec<Vec<u32>>>,
+    /// Whether each slot is occupied (alive vs deleted).
+    alive: Vec<bool>,
+    /// Number of alive nodes.
+    count: usize,
+
+    /// Entry point node ID.
+    entry_point: Option<u32>,
+    /// Vector dimensionality.
+    dim: usize,
+    /// Max connections per upper layer (M).
     m: usize,
-    /// Maximum number of connections at layer 0 (2*M).
+    /// Max connections at layer 0 (2*M).
     m_max0: usize,
     /// Beam width during graph construction.
     ef_construction: usize,
-    /// Level normalization factor: 1/ln(M).
+    /// Level normalization: 1/ln(M).
     ml: f64,
 }
 
 impl HnswGraph {
-    fn new(m: usize, ef_construction: usize) -> Self {
+    fn new(dim: usize, m: usize, ef_construction: usize) -> Self {
         Self {
-            nodes: FastHashMap::default(),
+            vectors: Vec::new(),
+            levels: Vec::new(),
+            neighbors: Vec::new(),
+            alive: Vec::new(),
+            count: 0,
             entry_point: None,
+            dim,
             m,
             m_max0: 2 * m,
             ef_construction,
@@ -169,31 +225,45 @@ impl HnswGraph {
         }
     }
 
-    /// Convert to serializable snapshot.
-    fn to_snapshot(&self) -> HnswGraphSnapshot {
-        HnswGraphSnapshot {
-            nodes: self.nodes.iter().map(|(&k, v)| (k, v.clone())).collect(),
-            entry_point: self.entry_point,
-            m: self.m,
-            m_max0: self.m_max0,
-            ef_construction: self.ef_construction,
-            ml: self.ml,
+    /// Ensure storage capacity for node `id`.
+    fn ensure_capacity(&mut self, id: u32) {
+        let needed = id as usize + 1;
+        if needed > self.alive.len() {
+            self.vectors.resize(needed * self.dim, 0.0);
+            self.levels.resize(needed, 0);
+            self.neighbors.resize_with(needed, Vec::new);
+            self.alive.resize(needed, false);
         }
     }
 
-    /// Restore from serializable snapshot.
-    fn from_snapshot(snap: HnswGraphSnapshot) -> Self {
-        Self {
-            nodes: snap.nodes.into_iter().collect(),
-            entry_point: snap.entry_point,
-            m: snap.m,
-            m_max0: snap.m_max0,
-            ef_construction: snap.ef_construction,
-            ml: snap.ml,
-        }
+    /// Pre-allocate for `additional` more nodes.
+    fn reserve(&mut self, additional: usize) {
+        self.vectors.reserve(additional * self.dim);
+        self.levels.reserve(additional);
+        self.neighbors.reserve(additional);
+        self.alive.reserve(additional);
     }
 
-    /// Generate a random level for a new node.
+    /// Get the vector slice for a node. O(1), no hash.
+    #[inline]
+    fn vector(&self, id: u32) -> &[f32] {
+        let start = id as usize * self.dim;
+        unsafe { self.vectors.get_unchecked(start..start + self.dim) }
+    }
+
+    /// Write a vector into the flat buffer.
+    #[inline]
+    fn set_vector(&mut self, id: u32, vec: &[f32]) {
+        let start = id as usize * self.dim;
+        self.vectors[start..start + self.dim].copy_from_slice(vec);
+    }
+
+    #[inline]
+    fn is_alive(&self, id: u32) -> bool {
+        let idx = id as usize;
+        idx < self.alive.len() && unsafe { *self.alive.get_unchecked(idx) }
+    }
+
     #[inline]
     fn random_level(&self) -> usize {
         let mut rng = rand::thread_rng();
@@ -201,147 +271,124 @@ impl HnswGraph {
         (-r.ln() * self.ml).floor() as usize
     }
 
-    /// Get the max level of the current entry point (or 0 if empty).
     #[inline]
     fn max_level(&self) -> usize {
         self.entry_point
-            .and_then(|ep| self.nodes.get(&ep))
-            .map(|node| node.level)
+            .map(|ep| self.levels[ep as usize] as usize)
             .unwrap_or(0)
     }
 
-    /// Get the maximum number of neighbors for the given layer.
     #[inline]
     fn max_neighbors(&self, layer: usize) -> usize {
         if layer == 0 { self.m_max0 } else { self.m }
     }
 
-    /// Search within a single layer using beam search.
-    /// Returns up to `ef` nearest neighbors found at this layer, sorted closest-first.
+    /// Beam search within a single layer. Returns up to `ef` nearest candidates.
     fn search_layer(
         &self,
         query: &[f32],
-        entry_ids: &[u64],
+        entry_ids: &[u32],
         ef: usize,
         layer: usize,
         metric: Metric,
+        vt: &mut VisitedTracker,
     ) -> Vec<Candidate> {
-        let mut visited = FastHashSet::with_capacity_and_hasher(ef * 2, Default::default());
-        // Min-heap: pop closest candidate to explore
+        vt.reset();
         let mut candidates = BinaryHeap::<std::cmp::Reverse<Candidate>>::new();
-        // Max-heap: pop farthest result to maintain bounded result set
         let mut results = BinaryHeap::<Candidate>::new();
+        let mut farthest_dist = f32::MAX;
 
-        // Initialize with entry points
         for &ep_id in entry_ids {
-            if !visited.insert(ep_id) {
-                continue;
-            }
-            if let Some(node) = self.nodes.get(&ep_id) {
-                let d = metric.distance(query, &node.vector);
-                let c = Candidate { distance: d, id: ep_id };
-                candidates.push(std::cmp::Reverse(c));
-                results.push(c);
-            }
+            if !vt.visit(ep_id) || !self.alive[ep_id as usize] { continue; }
+            let d = metric.distance(query, self.vector(ep_id));
+            let c = Candidate { distance: d, id: ep_id };
+            candidates.push(std::cmp::Reverse(c));
+            results.push(c);
+            farthest_dist = d; // single entry point typical
         }
 
         while let Some(std::cmp::Reverse(closest)) = candidates.pop() {
-            // Stop if closest candidate is farther than the farthest result
-            if let Some(farthest) = results.peek() {
-                if closest.distance > farthest.distance && results.len() >= ef {
-                    break;
-                }
+            if closest.distance > farthest_dist && results.len() >= ef {
+                break;
             }
 
-            // Explore neighbors of closest candidate at this layer
-            if let Some(node) = self.nodes.get(&closest.id) {
-                if layer < node.neighbors.len() {
-                    for &nb_id in &node.neighbors[layer] {
-                        if !visited.insert(nb_id) {
-                            continue;
+            let nbs = &self.neighbors[closest.id as usize];
+            if layer < nbs.len() {
+                for &nb_id in &nbs[layer] {
+                    if !vt.visit(nb_id) || !self.alive[nb_id as usize] { continue; }
+
+                    let d = metric.distance(query, self.vector(nb_id));
+
+                    if results.len() < ef || d < farthest_dist {
+                        let c = Candidate { distance: d, id: nb_id };
+                        candidates.push(std::cmp::Reverse(c));
+                        results.push(c);
+                        if results.len() > ef {
+                            results.pop();
                         }
-
-                        if let Some(nb_node) = self.nodes.get(&nb_id) {
-                            let d = metric.distance(query, &nb_node.vector);
-
-                            let should_add = if results.len() < ef {
-                                true
-                            } else if let Some(farthest) = results.peek() {
-                                d < farthest.distance
-                            } else {
-                                true
-                            };
-
-                            if should_add {
-                                let c = Candidate { distance: d, id: nb_id };
-                                candidates.push(std::cmp::Reverse(c));
-                                results.push(c);
-                                if results.len() > ef {
-                                    results.pop(); // remove farthest
-                                }
-                            }
+                        // Update cached farthest distance
+                        if let Some(f) = results.peek() {
+                            farthest_dist = f.distance;
                         }
                     }
                 }
             }
         }
 
-        // Convert max-heap to sorted vec (closest first)
         let mut result_vec: Vec<Candidate> = results.into_vec();
         result_vec.sort_unstable();
         result_vec
     }
 
-    /// Greedy search for the single closest node, descending from top layers.
-    /// More efficient than search_layer with ef=1 for the descent phase.
+    /// Greedy search for the single closest node at a given layer.
     #[inline]
     fn greedy_closest(
         &self,
         query: &[f32],
-        mut current: u64,
+        mut current: u32,
         layer: usize,
         metric: Metric,
-    ) -> u64 {
-        let mut current_dist = self.nodes.get(&current)
-            .map(|n| metric.distance(query, &n.vector))
-            .unwrap_or(f32::MAX);
+    ) -> u32 {
+        let mut current_dist = metric.distance(query, self.vector(current));
 
         loop {
             let mut changed = false;
-            if let Some(node) = self.nodes.get(&current) {
-                if layer < node.neighbors.len() {
-                    for &nb_id in &node.neighbors[layer] {
-                        if let Some(nb_node) = self.nodes.get(&nb_id) {
-                            let d = metric.distance(query, &nb_node.vector);
-                            if d < current_dist {
-                                current = nb_id;
-                                current_dist = d;
-                                changed = true;
-                            }
-                        }
+            let nbs = &self.neighbors[current as usize];
+            if layer < nbs.len() {
+                for &nb_id in &nbs[layer] {
+                    let d = metric.distance(query, self.vector(nb_id));
+                    if d < current_dist {
+                        current = nb_id;
+                        current_dist = d;
+                        changed = true;
                     }
                 }
             }
-            if !changed {
-                break;
-            }
+            if !changed { break; }
         }
         current
     }
 
     /// Insert a vector into the graph incrementally.
-    fn insert(&mut self, id: u64, vector: Vec<f32>, metric: Metric) {
+    fn insert(&mut self, id: u32, vector: &[f32], metric: Metric, vt: &mut VisitedTracker) {
         let new_level = self.random_level();
+        let dim = self.dim;
 
-        // Create the node with empty neighbor lists
-        let node = HnswNode {
-            vector,
-            neighbors: vec![Vec::new(); new_level + 1],
-            level: new_level,
-        };
-        self.nodes.insert(id, node);
+        // Allocate slot and store data
+        self.ensure_capacity(id);
+        vt.ensure_capacity(id as usize + 1);
+        self.set_vector(id, vector);
+        self.levels[id as usize] = new_level as u8;
+        // Pre-allocate neighbor vecs with expected capacity
+        let mut layer_vecs = Vec::with_capacity(new_level + 1);
+        for l in 0..=new_level {
+            layer_vecs.push(Vec::with_capacity(if l == 0 { self.m_max0 } else { self.m }));
+        }
+        self.neighbors[id as usize] = layer_vecs;
+        self.alive[id as usize] = true;
+        self.count += 1;
 
-        // If this is the first node, set as entry point and return
+        // First node → set as entry point
         let ep_id = match self.entry_point {
             None => {
                 self.entry_point = Some(id);
@@ -352,14 +399,12 @@ impl HnswGraph {
 
         let current_max_level = self.max_level();
 
-        // Get the query vector reference
-        let query = self.nodes[&id].vector.clone();
-
-        // Phase 1: Greedy descent from top layer down to new_level + 1
+        // Phase 1: Greedy descent from top layers
+        // Use the original `vector` parameter — same data, no clone needed.
         let mut current_ep = ep_id;
         if current_max_level > new_level {
             for layer in ((new_level + 1)..=current_max_level).rev() {
-                current_ep = self.greedy_closest(&query, current_ep, layer, metric);
+                current_ep = self.greedy_closest(vector, current_ep, layer, metric);
             }
         }
 
@@ -367,71 +412,56 @@ impl HnswGraph {
         let insert_top = new_level.min(current_max_level);
         for layer in (0..=insert_top).rev() {
             let results = self.search_layer(
-                &query,
-                &[current_ep],
-                self.ef_construction,
-                layer,
-                metric,
+                vector, &[current_ep], self.ef_construction, layer, metric, vt,
             );
 
-            // Select neighbors for this layer
-            let max_nb = self.max_neighbors(layer);
-            let m_to_select = max_nb.min(results.len());
-            let selected: Vec<u64> = results[..m_to_select].iter().map(|c| c.id).collect();
-
-            // Set neighbors for the new node at this layer
-            if let Some(node) = self.nodes.get_mut(&id) {
-                if layer < node.neighbors.len() {
-                    node.neighbors[layer] = selected.clone();
-                }
-            }
-
-            // Add back-edges from selected neighbors to the new node
             let max_conn = self.max_neighbors(layer);
-            for &nb_id in &selected {
+            let m_to_select = max_conn.min(results.len());
+
+            // Set forward edges directly from results (no intermediate Vec + clone)
+            self.neighbors[id as usize][layer].clear();
+            self.neighbors[id as usize][layer].extend(
+                results[..m_to_select].iter().map(|c| c.id)
+            );
+
+            // Add back-edges — iterate results slice directly
+            for i in 0..m_to_select {
+                let nb_id = results[i].id;
                 if nb_id == id { continue; }
 
-                // Add the back-edge
-                if let Some(nb_node) = self.nodes.get_mut(&nb_id) {
-                    while nb_node.neighbors.len() <= layer {
-                        nb_node.neighbors.push(Vec::new());
-                    }
-                    nb_node.neighbors[layer].push(id);
+                // Add back-edge
+                let nb_nbs = &mut self.neighbors[nb_id as usize];
+                while nb_nbs.len() <= layer {
+                    nb_nbs.push(Vec::new());
                 }
+                nb_nbs[layer].push(id);
 
-                // Prune if too many connections (separate borrow scope)
-                let needs_pruning = self.nodes.get(&nb_id)
-                    .map(|n| layer < n.neighbors.len() && n.neighbors[layer].len() > max_conn)
-                    .unwrap_or(false);
-
-                if needs_pruning {
-                    let (nb_vec, nb_neighbor_ids) = {
-                        let nb_node = &self.nodes[&nb_id];
-                        (nb_node.vector.as_slice() as *const [f32], nb_node.neighbors[layer].clone())
-                    };
-
-                    // SAFETY: nb_vec points to stable data in HashMap; we only mutate
-                    // neighbors, not the vector itself, so the pointer remains valid.
-                    let nb_vec_ref = unsafe { &*nb_vec };
-
-                    let mut nb_with_dist: Vec<Candidate> = nb_neighbor_ids
-                        .iter()
-                        .filter_map(|&nid| {
-                            self.nodes.get(&nid).map(|n| {
-                                Candidate { id: nid, distance: metric.distance(nb_vec_ref, &n.vector) }
-                            })
-                        })
-                        .collect();
-                    nb_with_dist.sort_unstable_by(|a, b| a.cmp(b));
-                    nb_with_dist.truncate(max_conn);
-
-                    if let Some(nb_node) = self.nodes.get_mut(&nb_id) {
-                        nb_node.neighbors[layer] = nb_with_dist.iter().map(|c| c.id).collect();
+                // Prune if over capacity: only 1 excess, so just find & remove the worst
+                if self.neighbors[nb_id as usize][layer].len() > max_conn {
+                    let nb_start = nb_id as usize * dim;
+                    let nbs_layer = &self.neighbors[nb_id as usize][layer];
+                    let mut worst_idx = 0;
+                    let mut worst_dist = f32::NEG_INFINITY;
+                    for (j, &nid) in nbs_layer.iter().enumerate() {
+                        if !self.alive[nid as usize] {
+                            // Dead nodes are worst — remove them first
+                            worst_idx = j;
+                            break;
+                        }
+                        let nid_start = nid as usize * dim;
+                        let d = metric.distance(
+                            &self.vectors[nb_start..nb_start + dim],
+                            &self.vectors[nid_start..nid_start + dim],
+                        );
+                        if d > worst_dist {
+                            worst_dist = d;
+                            worst_idx = j;
+                        }
                     }
+                    self.neighbors[nb_id as usize][layer].swap_remove(worst_idx);
                 }
             }
 
-            // Update entry point for the next lower layer's search
             if let Some(c) = results.first() {
                 current_ep = c.id;
             }
@@ -443,14 +473,15 @@ impl HnswGraph {
         }
     }
 
-    /// Search for k nearest neighbors across all layers.
+    /// Search for k nearest neighbors.
     fn search_knn(
         &self,
         query: &[f32],
         k: usize,
         ef_search: usize,
         metric: Metric,
-    ) -> Vec<(u64, f32)> {
+        vt: &mut VisitedTracker,
+    ) -> Vec<(u32, f32)> {
         let ep_id = match self.entry_point {
             None => return Vec::new(),
             Some(ep) => ep,
@@ -459,7 +490,6 @@ impl HnswGraph {
         let top = self.max_level();
         let ef = ef_search.max(k);
 
-        // Phase 1: Greedy descent from top layer to layer 1
         let mut current_ep = ep_id;
         if top > 0 {
             for layer in (1..=top).rev() {
@@ -467,8 +497,7 @@ impl HnswGraph {
             }
         }
 
-        // Phase 2: Beam search at layer 0
-        let results = self.search_layer(query, &[current_ep], ef, 0, metric);
+        let results = self.search_layer(query, &[current_ep], ef, 0, metric, vt);
         results.into_iter()
             .take(k)
             .map(|c| (c.id, c.distance))
@@ -476,31 +505,283 @@ impl HnswGraph {
     }
 
     /// Delete a node from the graph.
-    fn delete(&mut self, id: u64, _metric: Metric) -> bool {
-        let node = match self.nodes.remove(&id) {
-            Some(n) => n,
-            None => return false,
-        };
+    fn delete(&mut self, id: u32) -> bool {
+        if !self.is_alive(id) { return false; }
+
+        self.alive[id as usize] = false;
+        self.count -= 1;
 
         // Remove back-edges from all neighbors
-        for (layer, neighbors) in node.neighbors.iter().enumerate() {
-            for &nb_id in neighbors {
-                if let Some(nb_node) = self.nodes.get_mut(&nb_id) {
-                    if layer < nb_node.neighbors.len() {
-                        nb_node.neighbors[layer].retain(|&nid| nid != id);
+        let level = self.levels[id as usize] as usize;
+        for layer in 0..=level {
+            if layer < self.neighbors[id as usize].len() {
+                let nbs: Vec<u32> = self.neighbors[id as usize][layer].clone();
+                for nb_id in nbs {
+                    let nb_idx = nb_id as usize;
+                    if nb_idx < self.neighbors.len() && layer < self.neighbors[nb_idx].len() {
+                        self.neighbors[nb_idx][layer].retain(|&nid| nid != id);
+                    }
+                }
+            }
+        }
+        self.neighbors[id as usize].clear();
+
+        // Update entry point if deleted node was the entry point
+        if self.entry_point == Some(id) {
+            self.entry_point = self.alive.iter()
+                .enumerate()
+                .filter(|(_, &a)| a)
+                .max_by_key(|(i, _)| self.levels[*i])
+                .map(|(i, _)| i as u32);
+        }
+
+        true
+    }
+
+    /// Convert to serializable snapshot (for save/load).
+    fn to_snapshot(&self) -> HnswGraphSnapshot {
+        let mut nodes = HashMap::new();
+        for (i, &a) in self.alive.iter().enumerate() {
+            if a {
+                nodes.insert(i as u64, HnswNodeSnapshot {
+                    vector: self.vector(i as u32).to_vec(),
+                    neighbors: self.neighbors[i].iter()
+                        .map(|layer_nbs| layer_nbs.iter().map(|&n| n as u64).collect())
+                        .collect(),
+                    level: self.levels[i] as usize,
+                });
+            }
+        }
+        HnswGraphSnapshot {
+            nodes,
+            entry_point: self.entry_point.map(|e| e as u64),
+            m: self.m,
+            m_max0: self.m_max0,
+            ef_construction: self.ef_construction,
+            ml: self.ml,
+        }
+    }
+
+    /// Restore from serializable snapshot.
+    fn from_snapshot(snap: HnswGraphSnapshot, dim: usize) -> Self {
+        if snap.nodes.is_empty() {
+            return Self {
+                m: snap.m,
+                m_max0: snap.m_max0,
+                ef_construction: snap.ef_construction,
+                ml: snap.ml,
+                ..Self::new(dim, snap.m, snap.ef_construction)
+            };
+        }
+
+        let max_id = snap.nodes.keys().copied().max().unwrap_or(0) as usize;
+        let capacity = max_id + 1;
+
+        let mut graph = Self::new(dim, snap.m, snap.ef_construction);
+        graph.m_max0 = snap.m_max0;
+        graph.ml = snap.ml;
+        graph.entry_point = snap.entry_point.map(|e| e as u32);
+
+        graph.vectors.resize(capacity * dim, 0.0);
+        graph.levels.resize(capacity, 0);
+        graph.neighbors.resize_with(capacity, Vec::new);
+        graph.alive.resize(capacity, false);
+
+        for (id, node) in snap.nodes {
+            let idx = id as usize;
+            graph.set_vector(id as u32, &node.vector);
+            graph.levels[idx] = node.level as u8;
+            graph.neighbors[idx] = node.neighbors.iter()
+                .map(|layer| layer.iter().map(|&n| n as u32).collect())
+                .collect();
+            graph.alive[idx] = true;
+            graph.count += 1;
+        }
+
+        graph
+    }
+
+    /// Instrumented search_layer for profiling.
+    fn search_layer_instrumented(
+        &self,
+        query: &[f32],
+        entry_ids: &[u32],
+        ef: usize,
+        layer: usize,
+        metric: Metric,
+        vt: &mut VisitedTracker,
+        stats: &mut InsertStats,
+    ) -> Vec<Candidate> {
+        vt.reset();
+        let mut candidates = BinaryHeap::<std::cmp::Reverse<Candidate>>::new();
+        let mut results = BinaryHeap::<Candidate>::new();
+        let mut farthest_dist = f32::MAX;
+
+        for &ep_id in entry_ids {
+            if !vt.visit(ep_id) { continue; }
+            let t = std::time::Instant::now();
+            let vec = self.vector(ep_id);
+            stats.sl_hash_lookup += t.elapsed();
+            let t = std::time::Instant::now();
+            let d = metric.distance(query, vec);
+            stats.sl_distance += t.elapsed();
+            let c = Candidate { distance: d, id: ep_id };
+            let t = std::time::Instant::now();
+            candidates.push(std::cmp::Reverse(c));
+            results.push(c);
+            farthest_dist = d;
+            stats.sl_heap_ops += t.elapsed();
+        }
+
+        while let Some(std::cmp::Reverse(closest)) = candidates.pop() {
+            if closest.distance > farthest_dist && results.len() >= ef {
+                break;
+            }
+
+            let nbs = &self.neighbors[closest.id as usize];
+            if layer < nbs.len() {
+                for &nb_id in &nbs[layer] {
+                    if !vt.visit(nb_id) { continue; }
+
+                    let t = std::time::Instant::now();
+                    let vec = self.vector(nb_id);
+                    stats.sl_hash_lookup += t.elapsed();
+                    let t = std::time::Instant::now();
+                    let d = metric.distance(query, vec);
+                    stats.sl_distance += t.elapsed();
+
+                    if results.len() < ef || d < farthest_dist {
+                        let c = Candidate { distance: d, id: nb_id };
+                        let t = std::time::Instant::now();
+                        candidates.push(std::cmp::Reverse(c));
+                        results.push(c);
+                        if results.len() > ef {
+                            results.pop();
+                        }
+                        if let Some(f) = results.peek() {
+                            farthest_dist = f.distance;
+                        }
+                        stats.sl_heap_ops += t.elapsed();
                     }
                 }
             }
         }
 
-        // If deleted node was the entry point, find a new one
-        if self.entry_point == Some(id) {
-            self.entry_point = self.nodes.keys()
-                .max_by_key(|&&nid| self.nodes.get(&nid).map(|n| n.level).unwrap_or(0))
-                .copied();
+        let mut result_vec: Vec<Candidate> = results.into_vec();
+        result_vec.sort_unstable();
+        result_vec
+    }
+
+    /// Instrumented insert for profiling.
+    fn insert_instrumented(
+        &mut self, id: u32, vector: &[f32], metric: Metric,
+        vt: &mut VisitedTracker, stats: &mut InsertStats,
+    ) {
+        let t = std::time::Instant::now();
+        let new_level = self.random_level();
+        stats.random_level += t.elapsed();
+        let dim = self.dim;
+
+        let t = std::time::Instant::now();
+        self.ensure_capacity(id);
+        vt.ensure_capacity(id as usize + 1);
+        self.set_vector(id, vector);
+        self.levels[id as usize] = new_level as u8;
+        // Pre-allocate neighbor vecs with expected capacity
+        let mut layer_vecs = Vec::with_capacity(new_level + 1);
+        for l in 0..=new_level {
+            layer_vecs.push(Vec::with_capacity(if l == 0 { self.m_max0 } else { self.m }));
+        }
+        self.neighbors[id as usize] = layer_vecs;
+        self.alive[id as usize] = true;
+        self.count += 1;
+        stats.node_insert += t.elapsed();
+
+        let ep_id = match self.entry_point {
+            None => {
+                self.entry_point = Some(id);
+                return;
+            }
+            Some(ep) => ep,
+        };
+
+        let current_max_level = self.max_level();
+
+        // Use original vector parameter directly — no clone needed
+        let mut current_ep = ep_id;
+        if current_max_level > new_level {
+            let t = std::time::Instant::now();
+            for layer in ((new_level + 1)..=current_max_level).rev() {
+                current_ep = self.greedy_closest(vector, current_ep, layer, metric);
+            }
+            stats.greedy_descent += t.elapsed();
         }
 
-        true
+        let insert_top = new_level.min(current_max_level);
+        for layer in (0..=insert_top).rev() {
+            let t = std::time::Instant::now();
+            let results = self.search_layer_instrumented(
+                vector, &[current_ep], self.ef_construction, layer, metric, vt, stats,
+            );
+            stats.search_layer += t.elapsed();
+
+            let t = std::time::Instant::now();
+            let max_conn = self.max_neighbors(layer);
+            let m_to_select = max_conn.min(results.len());
+            // Set forward edges directly
+            self.neighbors[id as usize][layer].clear();
+            self.neighbors[id as usize][layer].extend(
+                results[..m_to_select].iter().map(|c| c.id)
+            );
+            stats.set_neighbors += t.elapsed();
+
+            for i in 0..m_to_select {
+                let nb_id = results[i].id;
+                if nb_id == id { continue; }
+
+                let t = std::time::Instant::now();
+                let nb_nbs = &mut self.neighbors[nb_id as usize];
+                while nb_nbs.len() <= layer {
+                    nb_nbs.push(Vec::new());
+                }
+                nb_nbs[layer].push(id);
+                stats.back_edges += t.elapsed();
+
+                // Prune if over capacity: swap-remove the worst
+                if self.neighbors[nb_id as usize][layer].len() > max_conn {
+                    let t = std::time::Instant::now();
+                    let nb_start = nb_id as usize * dim;
+                    let nbs_layer = &self.neighbors[nb_id as usize][layer];
+                    let mut worst_idx = 0;
+                    let mut worst_dist = f32::NEG_INFINITY;
+                    for (j, &nid) in nbs_layer.iter().enumerate() {
+                        if !self.alive[nid as usize] {
+                            worst_idx = j;
+                            break;
+                        }
+                        let nid_start = nid as usize * dim;
+                        let d = metric.distance(
+                            &self.vectors[nb_start..nb_start + dim],
+                            &self.vectors[nid_start..nid_start + dim],
+                        );
+                        if d > worst_dist {
+                            worst_dist = d;
+                            worst_idx = j;
+                        }
+                    }
+                    self.neighbors[nb_id as usize][layer].swap_remove(worst_idx);
+                    stats.pruning += t.elapsed();
+                }
+            }
+
+            if let Some(c) = results.first() {
+                current_ep = c.id;
+            }
+        }
+
+        if new_level > current_max_level {
+            self.entry_point = Some(id);
+        }
     }
 }
 
@@ -514,26 +795,28 @@ pub struct HnswIndex {
     config: IndexConfig,
     hnsw_config: HnswConfig,
     graph: HnswGraph,
+    /// Mutex allows `search` (&self) to mutate visited tracker.
+    /// Lock overhead (~100ns) is negligible vs search time (~50µs).
+    visited: Mutex<VisitedTracker>,
 }
 
 impl HnswIndex {
     pub fn new(dimensions: usize, metric: Metric, hnsw_config: HnswConfig) -> Self {
-        let graph = HnswGraph::new(hnsw_config.m, hnsw_config.ef_construction);
+        let graph = HnswGraph::new(dimensions, hnsw_config.m, hnsw_config.ef_construction);
         Self {
             config: IndexConfig { dimensions, metric },
             hnsw_config,
             graph,
+            visited: Mutex::new(VisitedTracker::new()),
         }
     }
 
-    /// Kept for API compatibility; no longer has any effect since inserts are incremental.
+    /// Kept for API compatibility; no longer has any effect.
     pub fn with_flush_threshold(self, _n: usize) -> Self {
         self
     }
 
-    /// Save the index to a binary file at `path` (bincode format).
-    ///
-    /// The full graph (vectors + connectivity) is persisted.
+    /// Save the index to a binary file (bincode format).
     pub fn save(&self, path: impl AsRef<std::path::Path>) -> Result<(), VectorDbError> {
         let file = std::fs::File::create(path)?;
         let mut writer = BufWriter::new(file);
@@ -548,9 +831,7 @@ impl HnswIndex {
         Ok(())
     }
 
-    /// Load an index from a binary file previously written by [`save`].
-    ///
-    /// The full graph is restored — no rebuild needed.
+    /// Load an index from a binary file.
     pub fn load(path: impl AsRef<std::path::Path>) -> Result<Self, VectorDbError> {
         let file = std::fs::File::open(&path)?;
         let reader = BufReader::new(file);
@@ -558,17 +839,22 @@ impl HnswIndex {
         // Try new format first
         let result: Result<HnswIndexSnapshot, _> = bincode::deserialize_from(reader);
         if let Ok(snapshot) = result {
+            let dim = snapshot.dimensions;
+            let graph = HnswGraph::from_snapshot(snapshot.graph, dim);
+            let mut vt = VisitedTracker::new();
+            vt.ensure_capacity(graph.alive.len());
             return Ok(Self {
                 config: IndexConfig {
                     dimensions: snapshot.dimensions,
                     metric: snapshot.metric,
                 },
                 hnsw_config: snapshot.hnsw_config,
-                graph: HnswGraph::from_snapshot(snapshot.graph),
+                graph,
+                visited: Mutex::new(vt),
             });
         }
 
-        // Fall back to legacy format (vectors only, needs incremental rebuild)
+        // Fall back to legacy format (vectors only, needs rebuild)
         let file = std::fs::File::open(&path)?;
         let reader = BufReader::new(file);
         let legacy: LegacyHnswIndexSnapshot = bincode::deserialize_from(reader)
@@ -577,16 +863,16 @@ impl HnswIndex {
         let hnsw_config = legacy.hnsw_config;
         let metric = legacy.metric;
         let mut index = Self::new(legacy.dimensions, metric, hnsw_config);
+        let vt = index.visited.get_mut().unwrap();
         for (id, vec) in legacy.vectors {
-            index.graph.insert(id, vec, metric);
+            index.graph.insert(id as u32, &vec, metric, vt);
         }
         Ok(index)
     }
 
-    /// Persist the HNSW graph to `path` so that future loads can skip rebuild.
-    /// With incremental HNSW, the graph is always up-to-date.
+    /// Persist the HNSW graph to `path`.
     pub fn save_graph(&self, path: &Path) -> Result<(), VectorDbError> {
-        if self.graph.nodes.is_empty() {
+        if self.graph.count == 0 {
             return Ok(());
         }
         let file = std::fs::File::create(path)?;
@@ -606,8 +892,25 @@ impl HnswIndex {
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
         let snapshot: HnswGraphSnapshot = bincode::deserialize(&mmap[..])
             .map_err(|e| VectorDbError::Serialization(e.to_string()))?;
-        self.graph = HnswGraph::from_snapshot(snapshot);
+        self.graph = HnswGraph::from_snapshot(snapshot, self.config.dimensions);
+        self.visited.get_mut().unwrap().ensure_capacity(self.graph.alive.len());
         Ok(())
+    }
+
+    /// Instrumented batch insert that returns timing stats.
+    pub fn add_batch_instrumented(&mut self, entries: &[(u64, Vec<f32>)]) -> InsertStats {
+        let mut stats = InsertStats::default();
+        let metric = self.config.metric;
+        let vt = self.visited.get_mut().unwrap();
+        if let Some(max_id) = entries.iter().map(|(id, _)| *id).max() {
+            self.graph.ensure_capacity(max_id as u32);
+            vt.ensure_capacity(max_id as usize + 1);
+        }
+        self.graph.reserve(entries.len());
+        for (id, vec) in entries {
+            self.graph.insert_instrumented(*id as u32, vec, metric, vt, &mut stats);
+        }
+        stats
     }
 
     /// Set the `ef_search` parameter at runtime (no rebuild needed).
@@ -624,16 +927,17 @@ impl VectorIndex for HnswIndex {
                 got: vector.len(),
             });
         }
-        if self.graph.nodes.contains_key(&id) {
+        let id32 = id as u32;
+        if self.graph.is_alive(id32) {
             return Err(VectorDbError::DuplicateId(id));
         }
         let metric = self.config.metric;
-        self.graph.insert(id, vector.to_vec(), metric);
+        let vt = self.visited.get_mut().unwrap();
+        self.graph.insert(id32, vector, metric, vt);
         Ok(())
     }
 
     fn add_batch(&mut self, entries: &[(u64, Vec<f32>)]) -> Result<(), VectorDbError> {
-        // Validate all entries first
         for (id, vec) in entries {
             if vec.len() != self.config.dimensions {
                 return Err(VectorDbError::DimensionMismatch {
@@ -641,15 +945,19 @@ impl VectorIndex for HnswIndex {
                     got: vec.len(),
                 });
             }
-            if self.graph.nodes.contains_key(id) {
+            if self.graph.is_alive(*id as u32) {
                 return Err(VectorDbError::DuplicateId(*id));
             }
         }
         let metric = self.config.metric;
-        // Pre-allocate nodes capacity
-        self.graph.nodes.reserve(entries.len());
+        let vt = self.visited.get_mut().unwrap();
+        if let Some(max_id) = entries.iter().map(|(id, _)| *id).max() {
+            self.graph.ensure_capacity(max_id as u32);
+            vt.ensure_capacity(max_id as usize + 1);
+        }
+        self.graph.reserve(entries.len());
         for (id, vec) in entries {
-            self.graph.insert(*id, vec.clone(), metric);
+            self.graph.insert(*id as u32, vec, metric, vt);
         }
         Ok(())
     }
@@ -661,29 +969,27 @@ impl VectorIndex for HnswIndex {
                 got: query.len(),
             });
         }
-        if k == 0 || self.graph.nodes.is_empty() {
+        if k == 0 || self.graph.count == 0 {
             return Ok(vec![]);
         }
 
+        let mut vt = self.visited.lock().unwrap();
         let results = self.graph.search_knn(
-            query,
-            k,
-            self.hnsw_config.ef_search,
-            self.config.metric,
+            query, k, self.hnsw_config.ef_search, self.config.metric, &mut vt,
         );
 
         Ok(results
             .into_iter()
-            .map(|(id, distance)| SearchResult { id, distance })
+            .map(|(id, distance)| SearchResult { id: id as u64, distance })
             .collect())
     }
 
     fn delete(&mut self, id: u64) -> bool {
-        self.graph.delete(id, self.config.metric)
+        self.graph.delete(id as u32)
     }
 
     fn len(&self) -> usize {
-        self.graph.nodes.len()
+        self.graph.count
     }
 
     fn config(&self) -> &IndexConfig {
@@ -692,7 +998,10 @@ impl VectorIndex for HnswIndex {
 
     fn iter_vectors(&self) -> Box<dyn Iterator<Item = (u64, Vec<f32>)> + '_> {
         Box::new(
-            self.graph.nodes.iter().map(|(&id, node)| (id, node.vector.clone()))
+            self.graph.alive.iter()
+                .enumerate()
+                .filter(|(_, &a)| a)
+                .map(|(i, _)| (i as u64, self.graph.vector(i as u32).to_vec()))
         )
     }
 
@@ -724,7 +1033,6 @@ mod tests {
             let v = vec![i as f32, 0.0, 0.0];
             idx.add(i, &v).unwrap();
         }
-        // flush is a no-op now, but called for API compatibility
         idx.flush();
         idx
     }
@@ -763,13 +1071,12 @@ mod tests {
     #[test]
     fn save_and_load_round_trip() {
         let idx = make_index();
-        let path = "/tmp/hnsw_index_test.json";
+        let path = "/tmp/hnsw_index_test_v3.bin";
         idx.save(path).unwrap();
         let loaded = HnswIndex::load(path).unwrap();
         assert_eq!(loaded.len(), idx.len());
         assert_eq!(loaded.config().dimensions, idx.config().dimensions);
         assert_eq!(loaded.config().metric, idx.config().metric);
-        // Nearest neighbour must still be correct after load
         let orig = idx.search(&[5.0, 0.0, 0.0], 1).unwrap();
         let from_disk = loaded.search(&[5.0, 0.0, 0.0], 1).unwrap();
         assert_eq!(orig[0].id, from_disk[0].id);
@@ -777,7 +1084,6 @@ mod tests {
 
     #[test]
     fn fallback_before_flush() {
-        // With incremental HNSW, search works immediately after insert (no flush needed).
         let cfg = HnswConfig::default();
         let mut idx = HnswIndex::new(2, Metric::L2, cfg);
         idx.add(1, &[1.0, 0.0]).unwrap();
@@ -794,7 +1100,6 @@ mod tests {
             idx.add(i, &[i as f32, 0.0]).unwrap();
         }
         idx.flush();
-        // All vectors point in the same direction — cosine distance ≈ 0 for any of them
         let r = idx.search(&[1.0, 0.0], 1).unwrap();
         assert!(r[0].distance < 1e-4);
     }
@@ -807,7 +1112,6 @@ mod tests {
             idx.add(i, &[i as f32, 0.0]).unwrap();
         }
         idx.flush();
-        // Largest dot product with [1,0] → id=20 (vector [20,0], distance = -20)
         let r = idx.search(&[1.0, 0.0], 1).unwrap();
         assert_eq!(r[0].id, 20);
     }
@@ -828,8 +1132,6 @@ mod tests {
 
     #[test]
     fn auto_flush_triggers_at_threshold() {
-        // With incremental HNSW, inserts build the graph immediately.
-        // No flush threshold needed — search works after any number of inserts.
         let cfg = HnswConfig::default();
         let mut idx = HnswIndex::new(1, Metric::L2, cfg);
         for i in 0..5u64 {
@@ -842,11 +1144,11 @@ mod tests {
 
     #[test]
     fn delete_then_flush_restores_search() {
-        let mut idx = make_index(); // 20 vectors
+        let mut idx = make_index();
         assert!(idx.delete(10));
-        idx.flush(); // no-op
+        idx.flush();
         let r = idx.search(&[10.0, 0.0, 0.0], 1).unwrap();
-        assert_ne!(r[0].id, 10); // deleted vector must not appear
+        assert_ne!(r[0].id, 10);
     }
 
     #[test]
@@ -855,7 +1157,7 @@ mod tests {
         let mut idx = HnswIndex::new(1, Metric::L2, cfg);
         let entries: Vec<(u64, Vec<f32>)> = (0..50u64).map(|i| (i, vec![i as f32])).collect();
         idx.add_batch(&entries).unwrap();
-        idx.flush(); // no-op
+        idx.flush();
         assert_eq!(idx.len(), 50);
         let r = idx.search(&[25.0], 1).unwrap();
         assert_eq!(r[0].id, 25);
@@ -863,13 +1165,12 @@ mod tests {
 
     #[test]
     fn save_with_staging_persists_all_vectors() {
-        // Insert vectors and verify they persist through save/load.
         let cfg = HnswConfig::default();
         let mut idx = HnswIndex::new(1, Metric::L2, cfg);
         for i in 0..10u64 {
             idx.add(i, &[i as f32]).unwrap();
         }
-        let path = "/tmp/hnsw_staging_test.json";
+        let path = "/tmp/hnsw_staging_test_v3.bin";
         idx.save(path).unwrap();
         let loaded = HnswIndex::load(path).unwrap();
         assert_eq!(loaded.len(), 10);

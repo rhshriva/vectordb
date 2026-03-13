@@ -23,3 +23,7 @@ faiss = { workspace = true, optional = true }
 [dev-dependencies]
 approx = "0.5"
 tempfile = { workspace = true }
+
+[[bench]]
+name = "profile_insert"
+harness = false
