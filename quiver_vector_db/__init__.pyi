@@ -114,6 +114,18 @@ class HnswIndex:
         """Add multiple vectors at once."""
         ...
 
+    def add_batch_np(self, vectors: Any, start_id: int = 0) -> None:
+        """Add vectors from a 2D numpy array (N x dim) with sequential IDs.
+
+        This is the fastest insert method — passes contiguous memory directly
+        to Rust with zero per-element Python overhead.
+
+        Args:
+            vectors: 2D numpy array of shape (N, dim), dtype float32.
+            start_id: First ID to assign (default 0). IDs are start_id..start_id+N-1.
+        """
+        ...
+
     def search(self, query: List[float], k: int) -> List[Dict[str, Any]]:
         """Search for the k nearest vectors.
 

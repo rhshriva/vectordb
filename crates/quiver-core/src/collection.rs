@@ -245,14 +245,10 @@ impl Collection {
         vector: Vec<f32>,
         payload: Option<serde_json::Value>,
     ) -> Result<(), VectorDbError> {
-        let entry = WalEntry::Add {
-            id,
-            vector: vector.clone(),
-            payload_bytes: payload.as_ref()
-                .map(|p| serde_json::to_vec(p).unwrap_or_default()),
-            sparse_bytes: None,
-        };
-        self.wal.append(&entry)?;
+        // Use borrow-based WAL append — avoids cloning the vector.
+        let pb = payload.as_ref()
+            .map(|p| serde_json::to_vec(p).unwrap_or_default());
+        self.wal.append_add(id, &vector, pb.as_deref(), None)?;
 
         // Update in-memory state
         self.index.delete(id);
@@ -269,20 +265,16 @@ impl Collection {
 
     /// Batch upsert multiple vectors at once. More efficient than calling
     /// `upsert` in a loop because WAL compaction and promotion checks happen
-    /// only once at the end.
+    /// only once at the end, and WAL flushes once for the entire batch.
     pub fn upsert_batch(
         &mut self,
         entries: Vec<(u64, Vec<f32>, Option<serde_json::Value>)>,
     ) -> Result<(), VectorDbError> {
         for (id, vector, payload) in entries {
-            let entry = WalEntry::Add {
-                id,
-                vector: vector.clone(),
-                payload_bytes: payload.as_ref()
-                    .map(|p| serde_json::to_vec(p).unwrap_or_default()),
-                sparse_bytes: None,
-            };
-            self.wal.append(&entry)?;
+            // Use no-flush variant — single flush after entire batch
+            let pb = payload.as_ref()
+                .map(|p| serde_json::to_vec(p).unwrap_or_default());
+            self.wal.append_add_no_flush(id, &vector, pb.as_deref(), None)?;
 
             self.index.delete(id);
             self.index.add(id, &vector)?;
@@ -291,6 +283,8 @@ impl Collection {
                 None => { self.payloads.remove(&id); }
             }
         }
+        // Single flush for the entire batch
+        self.wal.flush()?;
         self.maybe_compact()?;
         self.maybe_promote()?;
         Ok(())
@@ -307,17 +301,17 @@ impl Collection {
         sparse_vector: Option<SparseVector>,
         payload: Option<serde_json::Value>,
     ) -> Result<(), VectorDbError> {
-        let sparse_bytes = sparse_vector.as_ref().map(|sv| {
+        let sparse_bytes_owned = sparse_vector.as_ref().map(|sv| {
             bincode::serialize(sv).unwrap_or_default()
         });
-        let entry = WalEntry::Add {
+        let pb = payload.as_ref()
+            .map(|p| serde_json::to_vec(p).unwrap_or_default());
+        self.wal.append_add(
             id,
-            vector: vector.clone(),
-            payload_bytes: payload.as_ref()
-                .map(|p| serde_json::to_vec(p).unwrap_or_default()),
-            sparse_bytes,
-        };
-        self.wal.append(&entry)?;
+            &vector,
+            pb.as_deref(),
+            sparse_bytes_owned.as_deref(),
+        )?;
 
         // Update dense index
         self.index.delete(id);

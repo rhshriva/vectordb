@@ -4,6 +4,77 @@ use pyo3::types::{PyDict, PyList, PyTuple};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::collections::HashMap;
+
+/// Extract a batch of (id, vector) entries from a Python list of tuples.
+/// Uses buffer protocol for each vector when possible.
+#[inline]
+fn extract_batch_entries(entries: &Bound<'_, PyList>) -> PyResult<Vec<(u64, Vec<f32>)>> {
+    let mut batch = Vec::with_capacity(entries.len());
+    for item in entries.iter() {
+        let tuple = item.downcast::<PyTuple>()
+            .map_err(|_| PyValueError::new_err("each entry must be a tuple of (id, vector)"))?;
+        if tuple.len() < 2 {
+            return Err(PyValueError::new_err("each entry must be a tuple of (id, vector)"));
+        }
+        let id = tuple.get_item(0)?.extract::<u64>()?;
+        let vector = extract_f32_vec(&tuple.get_item(1)?)?;
+        batch.push((id, vector));
+    }
+    Ok(batch)
+}
+
+/// Extract a contiguous f32 buffer from a 2D numpy array / buffer.
+/// Returns (data, n_rows, n_cols) where data is a flat Vec<f32> in row-major order.
+#[cfg(any(not(Py_LIMITED_API), Py_3_11))]
+#[inline]
+fn extract_2d_f32_buffer(obj: &Bound<'_, PyAny>) -> PyResult<(Vec<f32>, usize, usize)> {
+    let buf = pyo3::buffer::PyBuffer::<f32>::get_bound(obj)
+        .map_err(|_| PyValueError::new_err("vectors must support the buffer protocol (e.g. numpy array)"))?;
+    let ndim = buf.dimensions();
+    if ndim != 2 {
+        return Err(PyValueError::new_err(format!(
+            "vectors must be 2-dimensional, got {ndim}-dimensional"
+        )));
+    }
+    let shape = buf.shape();
+    let n_rows = shape[0];
+    let n_cols = shape[1];
+    let total = n_rows * n_cols;
+    let mut data = vec![0.0f32; total];
+    buf.copy_to_slice(obj.py(), &mut data)
+        .map_err(|e| PyValueError::new_err(format!("buffer copy failed: {e}")))?;
+    Ok((data, n_rows, n_cols))
+}
+
+/// Extract a Vec<f32> from a Python object.
+///
+/// When the buffer protocol is available (PyO3 with non-limited API or Python ≥ 3.11),
+/// this uses PEP 3118 for numpy arrays / memoryview / ctypes arrays (fast memcpy).
+/// Otherwise falls back to PyO3's element-by-element extraction.
+///
+/// For a 128-dim vector:
+///   - numpy array via buffer protocol: ~100ns (single memcpy of 512 bytes)
+///   - Python list via PyO3 extract:    ~5µs  (128 × PyFloat_AsDouble calls)
+#[inline]
+fn extract_f32_vec(obj: &Bound<'_, PyAny>) -> PyResult<Vec<f32>> {
+    // Try buffer protocol when available (non-limited-API or Python ≥ 3.11)
+    #[cfg(any(not(Py_LIMITED_API), Py_3_11))]
+    {
+        if let Ok(buf) = pyo3::buffer::PyBuffer::<f32>::get_bound(obj) {
+            if buf.dimensions() != 1 {
+                return Err(PyValueError::new_err("vector must be 1-dimensional"));
+            }
+            let len = buf.item_count();
+            let mut vec = vec![0.0f32; len];
+            buf.copy_to_slice(obj.py(), &mut vec)
+                .map_err(|e| PyValueError::new_err(format!("buffer copy failed: {e}")))?;
+            return Ok(vec);
+        }
+    }
+
+    // Fallback: extract from Python list/sequence
+    obj.extract::<Vec<f32>>()
+}
 use quiver_core::{
     collection::{CollectionMeta, IndexType},
     distance::Metric,
@@ -189,18 +260,21 @@ impl PyFlatIndex {
 
     /// Add a single vector with the given ID.
     #[pyo3(signature = (id, vector))]
-    fn add(&mut self, id: u64, vector: Vec<f32>) -> PyResult<()> {
-        self.inner.add(id, &vector).map_err(vec_err_to_py)
+    fn add(&mut self, id: u64, vector: &Bound<'_, PyAny>) -> PyResult<()> {
+        let v = extract_f32_vec(vector)?;
+        self.inner.add(id, &v).map_err(vec_err_to_py)
     }
 
     /// Add multiple vectors at once. Takes a list of (id, vector) tuples.
-    fn add_batch(&mut self, entries: Vec<(u64, Vec<f32>)>) -> PyResult<()> {
-        self.inner.add_batch(&entries).map_err(vec_err_to_py)
+    fn add_batch(&mut self, entries: &Bound<'_, PyList>) -> PyResult<()> {
+        let batch = extract_batch_entries(entries)?;
+        self.inner.add_batch(&batch).map_err(vec_err_to_py)
     }
 
     /// Search for the k nearest vectors. Returns list of {"id": int, "distance": float}.
-    fn search(&self, py: Python<'_>, query: Vec<f32>, k: usize) -> PyResult<Vec<PyObject>> {
-        let results = py.allow_threads(|| self.inner.search(&query, k)).map_err(vec_err_to_py)?;
+    fn search(&self, py: Python<'_>, query: &Bound<'_, PyAny>, k: usize) -> PyResult<Vec<PyObject>> {
+        let q = extract_f32_vec(query)?;
+        let results = py.allow_threads(|| self.inner.search(&q, k)).map_err(vec_err_to_py)?;
         results.into_iter().map(|r| {
             let dict = PyDict::new_bound(py);
             dict.set_item("id", r.id)?;
@@ -269,16 +343,35 @@ impl PyHnswIndex {
     }
 
     #[pyo3(signature = (id, vector))]
-    fn add(&mut self, id: u64, vector: Vec<f32>) -> PyResult<()> {
-        self.inner.add(id, &vector).map_err(vec_err_to_py)
+    fn add(&mut self, id: u64, vector: &Bound<'_, PyAny>) -> PyResult<()> {
+        let v = extract_f32_vec(vector)?;
+        self.inner.add(id, &v).map_err(vec_err_to_py)
     }
 
-    fn add_batch(&mut self, entries: Vec<(u64, Vec<f32>)>) -> PyResult<()> {
-        self.inner.add_batch(&entries).map_err(vec_err_to_py)
+    fn add_batch(&mut self, entries: &Bound<'_, PyList>) -> PyResult<()> {
+        let batch = extract_batch_entries(entries)?;
+        self.inner.add_batch(&batch).map_err(vec_err_to_py)
     }
 
-    fn search(&self, py: Python<'_>, query: Vec<f32>, k: usize) -> PyResult<Vec<PyObject>> {
-        let results = py.allow_threads(|| self.inner.search(&query, k)).map_err(vec_err_to_py)?;
+    /// Add vectors from a 2D numpy array (N × dim) with sequential IDs starting from `start_id`.
+    /// This is the fastest way to insert vectors — no per-element Python extraction.
+    ///
+    /// Usage:
+    ///     vectors = np.random.randn(10000, 128).astype(np.float32)
+    ///     idx.add_batch_np(vectors)            # IDs: 0..9999
+    ///     idx.add_batch_np(vectors, start_id=5000)  # IDs: 5000..14999
+    #[cfg(any(not(Py_LIMITED_API), Py_3_11))]
+    #[pyo3(signature = (vectors, start_id = 0))]
+    fn add_batch_np(&mut self, py: Python<'_>, vectors: &Bound<'_, PyAny>, start_id: u64) -> PyResult<()> {
+        let (data, _n_rows, n_cols) = extract_2d_f32_buffer(vectors)?;
+        py.allow_threads(|| {
+            self.inner.add_batch_raw(&data, n_cols, start_id).map_err(vec_err_to_py)
+        })
+    }
+
+    fn search(&self, py: Python<'_>, query: &Bound<'_, PyAny>, k: usize) -> PyResult<Vec<PyObject>> {
+        let q = extract_f32_vec(query)?;
+        let results = py.allow_threads(|| self.inner.search(&q, k)).map_err(vec_err_to_py)?;
         results.into_iter().map(|r| {
             let dict = PyDict::new_bound(py);
             dict.set_item("id", r.id)?;
@@ -335,16 +428,19 @@ impl PyQuantizedFlatIndex {
     }
 
     #[pyo3(signature = (id, vector))]
-    fn add(&mut self, id: u64, vector: Vec<f32>) -> PyResult<()> {
-        self.inner.add(id, &vector).map_err(vec_err_to_py)
+    fn add(&mut self, id: u64, vector: &Bound<'_, PyAny>) -> PyResult<()> {
+        let v = extract_f32_vec(vector)?;
+        self.inner.add(id, &v).map_err(vec_err_to_py)
     }
 
-    fn add_batch(&mut self, entries: Vec<(u64, Vec<f32>)>) -> PyResult<()> {
-        self.inner.add_batch(&entries).map_err(vec_err_to_py)
+    fn add_batch(&mut self, entries: &Bound<'_, PyList>) -> PyResult<()> {
+        let batch = extract_batch_entries(entries)?;
+        self.inner.add_batch(&batch).map_err(vec_err_to_py)
     }
 
-    fn search(&self, py: Python<'_>, query: Vec<f32>, k: usize) -> PyResult<Vec<PyObject>> {
-        let results = py.allow_threads(|| self.inner.search(&query, k)).map_err(vec_err_to_py)?;
+    fn search(&self, py: Python<'_>, query: &Bound<'_, PyAny>, k: usize) -> PyResult<Vec<PyObject>> {
+        let q = extract_f32_vec(query)?;
+        let results = py.allow_threads(|| self.inner.search(&q, k)).map_err(vec_err_to_py)?;
         results.into_iter().map(|r| {
             let dict = PyDict::new_bound(py);
             dict.set_item("id", r.id)?;
@@ -397,16 +493,19 @@ impl PyFp16FlatIndex {
     }
 
     #[pyo3(signature = (id, vector))]
-    fn add(&mut self, id: u64, vector: Vec<f32>) -> PyResult<()> {
-        self.inner.add(id, &vector).map_err(vec_err_to_py)
+    fn add(&mut self, id: u64, vector: &Bound<'_, PyAny>) -> PyResult<()> {
+        let v = extract_f32_vec(vector)?;
+        self.inner.add(id, &v).map_err(vec_err_to_py)
     }
 
-    fn add_batch(&mut self, entries: Vec<(u64, Vec<f32>)>) -> PyResult<()> {
-        self.inner.add_batch(&entries).map_err(vec_err_to_py)
+    fn add_batch(&mut self, entries: &Bound<'_, PyList>) -> PyResult<()> {
+        let batch = extract_batch_entries(entries)?;
+        self.inner.add_batch(&batch).map_err(vec_err_to_py)
     }
 
-    fn search(&self, py: Python<'_>, query: Vec<f32>, k: usize) -> PyResult<Vec<PyObject>> {
-        let results = py.allow_threads(|| self.inner.search(&query, k)).map_err(vec_err_to_py)?;
+    fn search(&self, py: Python<'_>, query: &Bound<'_, PyAny>, k: usize) -> PyResult<Vec<PyObject>> {
+        let q = extract_f32_vec(query)?;
+        let results = py.allow_threads(|| self.inner.search(&q, k)).map_err(vec_err_to_py)?;
         results.into_iter().map(|r| {
             let dict = PyDict::new_bound(py);
             dict.set_item("id", r.id)?;
@@ -466,16 +565,19 @@ impl PyIvfIndex {
     }
 
     #[pyo3(signature = (id, vector))]
-    fn add(&mut self, id: u64, vector: Vec<f32>) -> PyResult<()> {
-        self.inner.add(id, &vector).map_err(vec_err_to_py)
+    fn add(&mut self, id: u64, vector: &Bound<'_, PyAny>) -> PyResult<()> {
+        let v = extract_f32_vec(vector)?;
+        self.inner.add(id, &v).map_err(vec_err_to_py)
     }
 
-    fn add_batch(&mut self, entries: Vec<(u64, Vec<f32>)>) -> PyResult<()> {
-        self.inner.add_batch(&entries).map_err(vec_err_to_py)
+    fn add_batch(&mut self, entries: &Bound<'_, PyList>) -> PyResult<()> {
+        let batch = extract_batch_entries(entries)?;
+        self.inner.add_batch(&batch).map_err(vec_err_to_py)
     }
 
-    fn search(&self, py: Python<'_>, query: Vec<f32>, k: usize) -> PyResult<Vec<PyObject>> {
-        let results = py.allow_threads(|| self.inner.search(&query, k)).map_err(vec_err_to_py)?;
+    fn search(&self, py: Python<'_>, query: &Bound<'_, PyAny>, k: usize) -> PyResult<Vec<PyObject>> {
+        let q = extract_f32_vec(query)?;
+        let results = py.allow_threads(|| self.inner.search(&q, k)).map_err(vec_err_to_py)?;
         results.into_iter().map(|r| {
             let dict = PyDict::new_bound(py);
             dict.set_item("id", r.id)?;
@@ -549,16 +651,19 @@ impl PyIvfPqIndex {
     }
 
     #[pyo3(signature = (id, vector))]
-    fn add(&mut self, id: u64, vector: Vec<f32>) -> PyResult<()> {
-        self.inner.add(id, &vector).map_err(vec_err_to_py)
+    fn add(&mut self, id: u64, vector: &Bound<'_, PyAny>) -> PyResult<()> {
+        let v = extract_f32_vec(vector)?;
+        self.inner.add(id, &v).map_err(vec_err_to_py)
     }
 
-    fn add_batch(&mut self, entries: Vec<(u64, Vec<f32>)>) -> PyResult<()> {
-        self.inner.add_batch(&entries).map_err(vec_err_to_py)
+    fn add_batch(&mut self, entries: &Bound<'_, PyList>) -> PyResult<()> {
+        let batch = extract_batch_entries(entries)?;
+        self.inner.add_batch(&batch).map_err(vec_err_to_py)
     }
 
-    fn search(&self, py: Python<'_>, query: Vec<f32>, k: usize) -> PyResult<Vec<PyObject>> {
-        let results = py.allow_threads(|| self.inner.search(&query, k)).map_err(vec_err_to_py)?;
+    fn search(&self, py: Python<'_>, query: &Bound<'_, PyAny>, k: usize) -> PyResult<Vec<PyObject>> {
+        let q = extract_f32_vec(query)?;
+        let results = py.allow_threads(|| self.inner.search(&q, k)).map_err(vec_err_to_py)?;
         results.into_iter().map(|r| {
             let dict = PyDict::new_bound(py);
             dict.set_item("id", r.id)?;
@@ -620,16 +725,19 @@ impl PyMmapFlatIndex {
     }
 
     #[pyo3(signature = (id, vector))]
-    fn add(&mut self, id: u64, vector: Vec<f32>) -> PyResult<()> {
-        self.inner.add(id, &vector).map_err(vec_err_to_py)
+    fn add(&mut self, id: u64, vector: &Bound<'_, PyAny>) -> PyResult<()> {
+        let v = extract_f32_vec(vector)?;
+        self.inner.add(id, &v).map_err(vec_err_to_py)
     }
 
-    fn add_batch(&mut self, entries: Vec<(u64, Vec<f32>)>) -> PyResult<()> {
-        self.inner.add_batch(&entries).map_err(vec_err_to_py)
+    fn add_batch(&mut self, entries: &Bound<'_, PyList>) -> PyResult<()> {
+        let batch = extract_batch_entries(entries)?;
+        self.inner.add_batch(&batch).map_err(vec_err_to_py)
     }
 
-    fn search(&self, py: Python<'_>, query: Vec<f32>, k: usize) -> PyResult<Vec<PyObject>> {
-        let results = py.allow_threads(|| self.inner.search(&query, k)).map_err(vec_err_to_py)?;
+    fn search(&self, py: Python<'_>, query: &Bound<'_, PyAny>, k: usize) -> PyResult<Vec<PyObject>> {
+        let q = extract_f32_vec(query)?;
+        let results = py.allow_threads(|| self.inner.search(&q, k)).map_err(vec_err_to_py)?;
         results.into_iter().map(|r| {
             let dict = PyDict::new_bound(py);
             dict.set_item("id", r.id)?;
@@ -678,16 +786,19 @@ impl PyBinaryFlatIndex {
     }
 
     #[pyo3(signature = (id, vector))]
-    fn add(&mut self, id: u64, vector: Vec<f32>) -> PyResult<()> {
-        self.inner.add(id, &vector).map_err(vec_err_to_py)
+    fn add(&mut self, id: u64, vector: &Bound<'_, PyAny>) -> PyResult<()> {
+        let v = extract_f32_vec(vector)?;
+        self.inner.add(id, &v).map_err(vec_err_to_py)
     }
 
-    fn add_batch(&mut self, entries: Vec<(u64, Vec<f32>)>) -> PyResult<()> {
-        self.inner.add_batch(&entries).map_err(vec_err_to_py)
+    fn add_batch(&mut self, entries: &Bound<'_, PyList>) -> PyResult<()> {
+        let batch = extract_batch_entries(entries)?;
+        self.inner.add_batch(&batch).map_err(vec_err_to_py)
     }
 
-    fn search(&self, py: Python<'_>, query: Vec<f32>, k: usize) -> PyResult<Vec<PyObject>> {
-        let results = py.allow_threads(|| self.inner.search(&query, k)).map_err(vec_err_to_py)?;
+    fn search(&self, py: Python<'_>, query: &Bound<'_, PyAny>, k: usize) -> PyResult<Vec<PyObject>> {
+        let q = extract_f32_vec(query)?;
+        let results = py.allow_threads(|| self.inner.search(&q, k)).map_err(vec_err_to_py)?;
         results.into_iter().map(|r| {
             let dict = PyDict::new_bound(py);
             dict.set_item("id", r.id)?;
@@ -735,7 +846,8 @@ struct PyCollection {
 impl PyCollection {
     /// Insert or update a vector by ID with optional metadata payload.
     #[pyo3(signature = (id, vector, payload=None))]
-    fn upsert(&mut self, py: Python<'_>, id: u64, vector: Vec<f32>, payload: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+    fn upsert(&mut self, py: Python<'_>, id: u64, vector: &Bound<'_, PyAny>, payload: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+        let v = extract_f32_vec(vector)?;
         let p = match payload {
             Some(v) if !v.is_none() => Some(py_to_json(v)?),
             _ => None,
@@ -744,7 +856,7 @@ impl PyCollection {
         let mut mgr = self.manager.write().unwrap();
         let col = mgr.get_collection_mut(&name)
             .ok_or_else(|| PyKeyError::new_err(format!("collection '{name}' not found")))?;
-        py.allow_threads(|| col.upsert(id, vector, p)).map_err(vec_err_to_py)
+        py.allow_threads(|| col.upsert(id, v, p)).map_err(vec_err_to_py)
     }
 
     /// Batch insert or update multiple vectors at once. More efficient than
@@ -765,7 +877,7 @@ impl PyCollection {
                 ));
             }
             let id = tuple.get_item(0)?.extract::<u64>()?;
-            let vector = tuple.get_item(1)?.extract::<Vec<f32>>()?;
+            let vector = extract_f32_vec(&tuple.get_item(1)?)?;
             let payload = if len == 3 {
                 let p = tuple.get_item(2)?;
                 if p.is_none() { None } else { Some(py_to_json(&p)?) }
@@ -785,7 +897,8 @@ impl PyCollection {
     ///
     /// Supports optional payload filtering with operators: $eq, $ne, $in, $gt, $gte, $lt, $lte, $and, $or.
     #[pyo3(signature = (query, k, filter=None))]
-    fn search(&self, py: Python<'_>, query: Vec<f32>, k: usize, filter: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<PyObject>> {
+    fn search(&self, py: Python<'_>, query: &Bound<'_, PyAny>, k: usize, filter: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<PyObject>> {
+        let q = extract_f32_vec(query)?;
         let f = match filter {
             Some(v) if !v.is_none() => Some(py_to_filter(v)?),
             _ => None,
@@ -794,7 +907,7 @@ impl PyCollection {
         let mgr = self.manager.read().unwrap();
         let col = mgr.get_collection(&name)
             .ok_or_else(|| PyKeyError::new_err(format!("collection '{name}' not found")))?;
-        let results = py.allow_threads(|| col.search(&query, k, f.as_ref())).map_err(vec_err_to_py)?;
+        let results = py.allow_threads(|| col.search(&q, k, f.as_ref())).map_err(vec_err_to_py)?;
         results.into_iter().map(|r| {
             let dict = PyDict::new_bound(py);
             dict.set_item("id", r.id)?;
@@ -816,10 +929,11 @@ impl PyCollection {
     #[pyo3(signature = (id, vector, sparse_vector=None, payload=None))]
     fn upsert_hybrid(
         &mut self, py: Python<'_>,
-        id: u64, vector: Vec<f32>,
+        id: u64, vector: &Bound<'_, PyAny>,
         sparse_vector: Option<&Bound<'_, PyDict>>,
         payload: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
+        let v = extract_f32_vec(vector)?;
         let sv = match sparse_vector {
             Some(d) => Some(py_dict_to_sparse(d)?),
             None => None,
@@ -832,7 +946,7 @@ impl PyCollection {
         let mut mgr = self.manager.write().unwrap();
         let col = mgr.get_collection_mut(&name)
             .ok_or_else(|| PyKeyError::new_err(format!("collection '{name}' not found")))?;
-        py.allow_threads(|| col.upsert_hybrid(id, vector, sv, p)).map_err(vec_err_to_py)
+        py.allow_threads(|| col.upsert_hybrid(id, v, sv, p)).map_err(vec_err_to_py)
     }
 
     /// Hybrid dense+sparse search with weighted score fusion.
@@ -850,13 +964,14 @@ impl PyCollection {
     #[pyo3(signature = (dense_query, sparse_query, k, dense_weight=0.7, sparse_weight=0.3, filter=None))]
     fn search_hybrid(
         &self, py: Python<'_>,
-        dense_query: Vec<f32>,
+        dense_query: &Bound<'_, PyAny>,
         sparse_query: &Bound<'_, PyDict>,
         k: usize,
         dense_weight: f32,
         sparse_weight: f32,
         filter: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Vec<PyObject>> {
+        let dq = extract_f32_vec(dense_query)?;
         let sq = py_dict_to_sparse(sparse_query)?;
         let f = match filter {
             Some(v) if !v.is_none() => Some(py_to_filter(v)?),
@@ -867,7 +982,7 @@ impl PyCollection {
         let col = mgr.get_collection(&name)
             .ok_or_else(|| PyKeyError::new_err(format!("collection '{name}' not found")))?;
         let results = py.allow_threads(|| {
-            col.search_hybrid(&dense_query, &sq, k, dense_weight, sparse_weight, f.as_ref())
+            col.search_hybrid(&dq, &sq, k, dense_weight, sparse_weight, f.as_ref())
         }).map_err(vec_err_to_py)?;
         results.into_iter().map(|r| {
             let dict = PyDict::new_bound(py);

@@ -46,7 +46,10 @@ SEED = 42
 # Minimum performance thresholds (intentionally conservative)
 # ---------------------------------------------------------------------------
 
-# Insert throughput (vec/s) — calibrated for N=2000, debug builds
+# Insert throughput (vec/s) — calibrated for N=2000, debug builds.
+# Note: release builds are ~40x faster (e.g. HNSW ~20K vec/s release vs ~500 debug).
+# Index-level benchmarks (flat, hnsw, etc.) measure raw in-memory insert — no WAL/disk I/O.
+# Collection-level benchmarks include WAL writes.
 MIN_INSERT_THROUGHPUT = {
     "flat": 1_000,
     "hnsw": 100,
@@ -341,38 +344,67 @@ class TestInsertThroughput:
         """Comparison table of insert throughput vs 3 competitors."""
         rows = []
 
-        # Quiver HNSW
-        idx = quiver.HnswIndex(dimensions=DIM, metric="l2")
-        entries = [(i, v) for i, v in enumerate(vectors_list)]
+        # All HNSW indexes use M=16, ef_construction=200 for fair comparison
+        BENCH_M = 16
+        BENCH_EF_CONSTRUCTION = 200
+
+        # Quiver HNSW (numpy batch — same style as faiss/hnswlib)
+        idx = quiver.HnswIndex(dimensions=DIM, metric="l2",
+                               m=BENCH_M, ef_construction=BENCH_EF_CONSTRUCTION)
+        vectors_np = np.array(vectors_list, dtype=np.float32)
         t0 = time.perf_counter()
-        idx.add_batch(entries)
+        idx.add_batch_np(vectors_np)
         idx.flush()
         elapsed = time.perf_counter() - t0
-        rows.append(("Quiver HNSW", f"{elapsed:.3f}s", f"{N/elapsed:,.0f}"))
+        rows.append(("Quiver HNSW (1T)", f"{elapsed:.3f}s", f"{N/elapsed:,.0f}"))
 
-        # hnswlib
+        # hnswlib — single-threaded for fair comparison
         hnswlib = try_import("hnswlib")
         if hnswlib:
             idx_h = hnswlib.Index(space="l2", dim=DIM)
-            idx_h.init_index(max_elements=N, M=16, ef_construction=200)
-            vectors_np = np.array(vectors_list, dtype=np.float32)
+            idx_h.init_index(max_elements=N, M=BENCH_M,
+                             ef_construction=BENCH_EF_CONSTRUCTION)
+            idx_h.set_num_threads(1)
             t0 = time.perf_counter()
             idx_h.add_items(vectors_np, np.arange(N))
             elapsed = time.perf_counter() - t0
-            rows.append(("hnswlib", f"{elapsed:.3f}s", f"{N/elapsed:,.0f}"))
+            rows.append(("hnswlib (1T)", f"{elapsed:.3f}s", f"{N/elapsed:,.0f}"))
+
+            # Also show multi-threaded for context
+            import os
+            n_cores = os.cpu_count() or 1
+            idx_h2 = hnswlib.Index(space="l2", dim=DIM)
+            idx_h2.init_index(max_elements=N, M=BENCH_M,
+                              ef_construction=BENCH_EF_CONSTRUCTION)
+            idx_h2.set_num_threads(n_cores)
+            t0 = time.perf_counter()
+            idx_h2.add_items(vectors_np, np.arange(N))
+            elapsed = time.perf_counter() - t0
+            rows.append((f"hnswlib ({n_cores}T)", f"{elapsed:.3f}s", f"{N/elapsed:,.0f}"))
         else:
             rows.append(("hnswlib", "SKIP", "not installed"))
 
-        # faiss HNSW
+        # faiss HNSW — single-threaded for fair comparison
         faiss = try_import("faiss")
         if faiss:
-            idx_f = faiss.IndexHNSWFlat(DIM, 16)
-            idx_f.hnsw.efConstruction = 200
-            vectors_np = np.array(vectors_list, dtype=np.float32)
+            import os
+            n_cores = os.cpu_count() or 1
+            faiss.omp_set_num_threads(1)
+            idx_f = faiss.IndexHNSWFlat(DIM, BENCH_M)
+            idx_f.hnsw.efConstruction = BENCH_EF_CONSTRUCTION
             t0 = time.perf_counter()
             idx_f.add(vectors_np)
             elapsed = time.perf_counter() - t0
-            rows.append(("faiss HNSW", f"{elapsed:.3f}s", f"{N/elapsed:,.0f}"))
+            rows.append(("faiss HNSW (1T)", f"{elapsed:.3f}s", f"{N/elapsed:,.0f}"))
+
+            # Also show multi-threaded for context
+            faiss.omp_set_num_threads(n_cores)
+            idx_f2 = faiss.IndexHNSWFlat(DIM, BENCH_M)
+            idx_f2.hnsw.efConstruction = BENCH_EF_CONSTRUCTION
+            t0 = time.perf_counter()
+            idx_f2.add(vectors_np)
+            elapsed = time.perf_counter() - t0
+            rows.append((f"faiss HNSW ({n_cores}T)", f"{elapsed:.3f}s", f"{N/elapsed:,.0f}"))
         else:
             rows.append(("faiss HNSW", "SKIP", "not installed"))
 
@@ -393,7 +425,7 @@ class TestInsertThroughput:
         except ImportError:
             rows.append(("ChromaDB", "SKIP", "not installed"))
 
-        print(f"\n\n=== Insert Throughput vs Competitors ({N:,} vectors, {DIM}d) ===")
+        print(f"\n\n=== Insert Throughput vs Competitors ({N:,} vectors, {DIM}d, M={BENCH_M}) ===")
         fmt_table(["Library", "Time", "Throughput (vec/s)"], rows)
 
 
@@ -449,8 +481,17 @@ class TestSearchLatency:
         queries_np_arr = np.array(queries_list, dtype=np.float32)
         rows = []
 
+        # All HNSW indexes use M=16, ef_construction=200 for fair comparison
+        BENCH_M = 16
+        BENCH_EF_CONSTRUCTION = 200
+
         # Quiver HNSW
-        idx = build_quiver_index("hnsw", vectors_list)
+        idx = quiver.HnswIndex(dimensions=DIM, metric="l2",
+                               m=BENCH_M, ef_construction=BENCH_EF_CONSTRUCTION,
+                               ef_search=50)
+        entries = [(i, v) for i, v in enumerate(vectors_list)]
+        idx.add_batch(entries)
+        idx.flush()
         lats = []
         for q in queries_list:
             t0 = time.perf_counter()
@@ -465,7 +506,8 @@ class TestSearchLatency:
         hnswlib = try_import("hnswlib")
         if hnswlib:
             idx_h = hnswlib.Index(space="l2", dim=DIM)
-            idx_h.init_index(max_elements=N, M=16, ef_construction=200)
+            idx_h.init_index(max_elements=N, M=BENCH_M,
+                             ef_construction=BENCH_EF_CONSTRUCTION)
             vectors_np = np.array(vectors_list, dtype=np.float32)
             idx_h.add_items(vectors_np, np.arange(N))
             idx_h.set_ef(50)
@@ -484,8 +526,8 @@ class TestSearchLatency:
         # faiss HNSW
         faiss = try_import("faiss")
         if faiss:
-            idx_f = faiss.IndexHNSWFlat(DIM, 16)
-            idx_f.hnsw.efConstruction = 200
+            idx_f = faiss.IndexHNSWFlat(DIM, BENCH_M)
+            idx_f.hnsw.efConstruction = BENCH_EF_CONSTRUCTION
             idx_f.hnsw.efSearch = 50
             vectors_np = np.array(vectors_list, dtype=np.float32)
             idx_f.add(vectors_np)

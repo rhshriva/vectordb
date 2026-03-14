@@ -133,16 +133,25 @@ impl PartialOrd for Candidate {
 
 // ── Visited tracker (generation-based, O(1) reset) ──────────────────────
 
-/// Tracks which nodes have been visited during a search.
-/// Uses a generation counter to avoid clearing the Vec between searches.
+/// Tracks which nodes have been visited during a search, plus reusable
+/// scratch heaps to avoid per-search allocation.
 struct VisitedTracker {
     marks: Vec<u32>,
     gen: u32,
+    /// Reusable min-heap of candidates (cleared between searches).
+    candidates: BinaryHeap<std::cmp::Reverse<Candidate>>,
+    /// Reusable max-heap of results (cleared between searches).
+    results: BinaryHeap<Candidate>,
 }
 
 impl VisitedTracker {
     fn new() -> Self {
-        Self { marks: Vec::new(), gen: 1 }
+        Self {
+            marks: Vec::new(),
+            gen: 1,
+            candidates: BinaryHeap::new(),
+            results: BinaryHeap::new(),
+        }
     }
 
     fn ensure_capacity(&mut self, n: usize) {
@@ -187,8 +196,18 @@ struct HnswGraph {
     vectors: Vec<f32>,
     /// Level per node (max 255 layers).
     levels: Vec<u8>,
-    /// `neighbors[node_id][layer]` = Vec of neighbor u32 IDs.
-    neighbors: Vec<Vec<Vec<u32>>>,
+
+    // ── Layer-0 neighbors: flat contiguous buffer (cache-friendly) ──
+    // Node i's layer-0 neighbors at: layer0[i * m_max0 .. i * m_max0 + layer0_counts[i]]
+    // This eliminates 2 levels of pointer indirection vs Vec<Vec<Vec<u32>>>.
+    layer0: Vec<u32>,
+    layer0_counts: Vec<u16>,
+
+    // ── Upper-layer neighbors (level ≥ 1): dynamic, sparse ──
+    // upper_neighbors[node_id][layer_idx] where layer_idx = layer - 1
+    // Only nodes with level > 0 have non-empty entries. Rarely accessed.
+    upper_neighbors: Vec<Vec<Vec<u32>>>,
+
     /// Whether each slot is occupied (alive vs deleted).
     alive: Vec<bool>,
     /// Number of alive nodes.
@@ -213,7 +232,9 @@ impl HnswGraph {
         Self {
             vectors: Vec::new(),
             levels: Vec::new(),
-            neighbors: Vec::new(),
+            layer0: Vec::new(),
+            layer0_counts: Vec::new(),
+            upper_neighbors: Vec::new(),
             alive: Vec::new(),
             count: 0,
             entry_point: None,
@@ -225,22 +246,35 @@ impl HnswGraph {
         }
     }
 
+    /// Stride per node in layer0 buffer: m_max0 + 1 to allow temporary overflow
+    /// during pruning (push one over capacity, then swap-remove the worst).
+    #[inline]
+    fn layer0_stride(&self) -> usize {
+        self.m_max0 + 1
+    }
+
     /// Ensure storage capacity for node `id`.
     fn ensure_capacity(&mut self, id: u32) {
         let needed = id as usize + 1;
         if needed > self.alive.len() {
+            let stride = self.layer0_stride();
             self.vectors.resize(needed * self.dim, 0.0);
             self.levels.resize(needed, 0);
-            self.neighbors.resize_with(needed, Vec::new);
+            self.layer0.resize(needed * stride, 0);
+            self.layer0_counts.resize(needed, 0);
+            self.upper_neighbors.resize_with(needed, Vec::new);
             self.alive.resize(needed, false);
         }
     }
 
     /// Pre-allocate for `additional` more nodes.
     fn reserve(&mut self, additional: usize) {
+        let stride = self.layer0_stride();
         self.vectors.reserve(additional * self.dim);
         self.levels.reserve(additional);
-        self.neighbors.reserve(additional);
+        self.layer0.reserve(additional * stride);
+        self.layer0_counts.reserve(additional);
+        self.upper_neighbors.reserve(additional);
         self.alive.reserve(additional);
     }
 
@@ -283,6 +317,26 @@ impl HnswGraph {
         if layer == 0 { self.m_max0 } else { self.m }
     }
 
+    /// Get neighbor IDs for a node at a given layer.
+    /// Layer 0 reads from flat contiguous buffer; upper layers from dynamic Vecs.
+    #[inline]
+    fn get_neighbors(&self, node_id: u32, layer: usize) -> &[u32] {
+        if layer == 0 {
+            let stride = self.layer0_stride();
+            let start = node_id as usize * stride;
+            let count = self.layer0_counts[node_id as usize] as usize;
+            &self.layer0[start..start + count]
+        } else {
+            let upper = &self.upper_neighbors[node_id as usize];
+            let layer_idx = layer - 1;
+            if layer_idx < upper.len() {
+                &upper[layer_idx]
+            } else {
+                &[]
+            }
+        }
+    }
+
     /// Beam search within a single layer. Returns up to `ef` nearest candidates.
     fn search_layer(
         &self,
@@ -294,48 +348,81 @@ impl HnswGraph {
         vt: &mut VisitedTracker,
     ) -> Vec<Candidate> {
         vt.reset();
-        let mut candidates = BinaryHeap::<std::cmp::Reverse<Candidate>>::new();
-        let mut results = BinaryHeap::<Candidate>::new();
+        // Reuse scratch heaps (clear retains allocated capacity)
+        vt.candidates.clear();
+        vt.results.clear();
         let mut farthest_dist = f32::MAX;
 
         for &ep_id in entry_ids {
             if !vt.visit(ep_id) || !self.alive[ep_id as usize] { continue; }
-            let d = metric.distance(query, self.vector(ep_id));
+            let d = metric.distance_ord(query, self.vector(ep_id));
             let c = Candidate { distance: d, id: ep_id };
-            candidates.push(std::cmp::Reverse(c));
-            results.push(c);
+            vt.candidates.push(std::cmp::Reverse(c));
+            vt.results.push(c);
             farthest_dist = d; // single entry point typical
         }
 
-        while let Some(std::cmp::Reverse(closest)) = candidates.pop() {
-            if closest.distance > farthest_dist && results.len() >= ef {
+        while let Some(std::cmp::Reverse(closest)) = vt.candidates.pop() {
+            if closest.distance > farthest_dist && vt.results.len() >= ef {
                 break;
             }
 
-            let nbs = &self.neighbors[closest.id as usize];
-            if layer < nbs.len() {
-                for &nb_id in &nbs[layer] {
-                    if !vt.visit(nb_id) || !self.alive[nb_id as usize] { continue; }
+            let nbs = self.get_neighbors(closest.id, layer);
 
-                    let d = metric.distance(query, self.vector(nb_id));
+            // Collect valid (newly visited + alive) neighbors into a stack buffer
+            let mut valid = [0u32; 64];
+            let mut valid_count = 0usize;
+            for &nb_id in nbs {
+                if vt.visit(nb_id) && self.alive[nb_id as usize] {
+                    valid[valid_count] = nb_id;
+                    valid_count += 1;
+                }
+            }
 
-                    if results.len() < ef || d < farthest_dist {
-                        let c = Candidate { distance: d, id: nb_id };
-                        candidates.push(std::cmp::Reverse(c));
-                        results.push(c);
-                        if results.len() > ef {
-                            results.pop();
+            // Process in batches of 4 for instruction-level parallelism
+            let mut i = 0;
+            while i + 4 <= valid_count {
+                let ids = [valid[i], valid[i + 1], valid[i + 2], valid[i + 3]];
+                let dists = metric.distance_ord_batch4(query, [
+                    self.vector(ids[0]), self.vector(ids[1]),
+                    self.vector(ids[2]), self.vector(ids[3]),
+                ]);
+                for j in 0..4 {
+                    if vt.results.len() < ef || dists[j] < farthest_dist {
+                        let c = Candidate { distance: dists[j], id: ids[j] };
+                        vt.candidates.push(std::cmp::Reverse(c));
+                        vt.results.push(c);
+                        if vt.results.len() > ef {
+                            vt.results.pop();
                         }
-                        // Update cached farthest distance
-                        if let Some(f) = results.peek() {
+                        if let Some(f) = vt.results.peek() {
                             farthest_dist = f.distance;
                         }
                     }
                 }
+                i += 4;
+            }
+            // Remaining 0-3 neighbors
+            while i < valid_count {
+                let nb_id = valid[i];
+                let d = metric.distance_ord(query, self.vector(nb_id));
+                if vt.results.len() < ef || d < farthest_dist {
+                    let c = Candidate { distance: d, id: nb_id };
+                    vt.candidates.push(std::cmp::Reverse(c));
+                    vt.results.push(c);
+                    if vt.results.len() > ef {
+                        vt.results.pop();
+                    }
+                    if let Some(f) = vt.results.peek() {
+                        farthest_dist = f.distance;
+                    }
+                }
+                i += 1;
             }
         }
 
-        let mut result_vec: Vec<Candidate> = results.into_vec();
+        // Drain results into a sorted Vec (drain retains heap capacity for reuse)
+        let mut result_vec: Vec<Candidate> = vt.results.drain().collect();
         result_vec.sort_unstable();
         result_vec
     }
@@ -349,25 +436,62 @@ impl HnswGraph {
         layer: usize,
         metric: Metric,
     ) -> u32 {
-        let mut current_dist = metric.distance(query, self.vector(current));
+        let mut current_dist = metric.distance_ord(query, self.vector(current));
 
         loop {
             let mut changed = false;
-            let nbs = &self.neighbors[current as usize];
-            if layer < nbs.len() {
-                for &nb_id in &nbs[layer] {
-                    let d = metric.distance(query, self.vector(nb_id));
-                    if d < current_dist {
-                        current = nb_id;
-                        current_dist = d;
-                        changed = true;
-                    }
+            let nbs = self.get_neighbors(current, layer);
+            for &nb_id in nbs {
+                let d = metric.distance_ord(query, self.vector(nb_id));
+                if d < current_dist {
+                    current = nb_id;
+                    current_dist = d;
+                    changed = true;
                 }
             }
             if !changed { break; }
         }
         current
     }
+
+    // ── Layer-0 flat buffer helpers ─────────────────────────────────────
+
+    /// Set layer-0 neighbors for a node (overwrites existing).
+    #[inline]
+    fn set_layer0_neighbors(&mut self, node_id: u32, neighbors: &[u32]) {
+        let stride = self.layer0_stride();
+        let start = node_id as usize * stride;
+        let count = neighbors.len().min(self.m_max0);
+        self.layer0[start..start + count].copy_from_slice(&neighbors[..count]);
+        self.layer0_counts[node_id as usize] = count as u16;
+    }
+
+    /// Push a neighbor onto node's layer-0 list. Returns new count.
+    /// Buffer has m_max0+1 slots to allow temporary overflow before pruning.
+    #[inline]
+    fn push_layer0_neighbor(&mut self, node_id: u32, neighbor: u32) -> usize {
+        let stride = self.layer0_stride();
+        let start = node_id as usize * stride;
+        let count = self.layer0_counts[node_id as usize] as usize;
+        // stride = m_max0 + 1, so we can always push one over m_max0
+        self.layer0[start + count] = neighbor;
+        self.layer0_counts[node_id as usize] = (count + 1) as u16;
+        count + 1
+    }
+
+    /// Remove neighbor at index from node's layer-0 list (swap-remove).
+    #[inline]
+    fn swap_remove_layer0(&mut self, node_id: u32, idx: usize) {
+        let stride = self.layer0_stride();
+        let start = node_id as usize * stride;
+        let count = self.layer0_counts[node_id as usize] as usize;
+        if idx < count {
+            self.layer0[start + idx] = self.layer0[start + count - 1];
+            self.layer0_counts[node_id as usize] = (count - 1) as u16;
+        }
+    }
+
+    // ── Insert ──────────────────────────────────────────────────────────
 
     /// Insert a vector into the graph incrementally.
     fn insert(&mut self, id: u32, vector: &[f32], metric: Metric, vt: &mut VisitedTracker) {
@@ -379,12 +503,18 @@ impl HnswGraph {
         vt.ensure_capacity(id as usize + 1);
         self.set_vector(id, vector);
         self.levels[id as usize] = new_level as u8;
-        // Pre-allocate neighbor vecs with expected capacity
-        let mut layer_vecs = Vec::with_capacity(new_level + 1);
-        for l in 0..=new_level {
-            layer_vecs.push(Vec::with_capacity(if l == 0 { self.m_max0 } else { self.m }));
+        // Layer-0: already zeroed by ensure_capacity
+        self.layer0_counts[id as usize] = 0;
+        // Upper layers: pre-allocate if node has level > 0
+        if new_level > 0 {
+            let mut upper_vecs = Vec::with_capacity(new_level);
+            for _ in 0..new_level {
+                upper_vecs.push(Vec::with_capacity(self.m));
+            }
+            self.upper_neighbors[id as usize] = upper_vecs;
+        } else {
+            self.upper_neighbors[id as usize] = Vec::new();
         }
-        self.neighbors[id as usize] = layer_vecs;
         self.alive[id as usize] = true;
         self.count += 1;
 
@@ -400,7 +530,6 @@ impl HnswGraph {
         let current_max_level = self.max_level();
 
         // Phase 1: Greedy descent from top layers
-        // Use the original `vector` parameter — same data, no clone needed.
         let mut current_ep = ep_id;
         if current_max_level > new_level {
             for layer in ((new_level + 1)..=current_max_level).rev() {
@@ -418,47 +547,88 @@ impl HnswGraph {
             let max_conn = self.max_neighbors(layer);
             let m_to_select = max_conn.min(results.len());
 
-            // Set forward edges directly from results (no intermediate Vec + clone)
-            self.neighbors[id as usize][layer].clear();
-            self.neighbors[id as usize][layer].extend(
-                results[..m_to_select].iter().map(|c| c.id)
-            );
+            // Set forward edges for this node (stack array avoids heap allocation)
+            if layer == 0 {
+                let mut ids = [0u32; 64]; // m_max0 is typically 24
+                for (i, c) in results[..m_to_select].iter().enumerate() {
+                    ids[i] = c.id;
+                }
+                self.set_layer0_neighbors(id, &ids[..m_to_select]);
+            } else {
+                let layer_idx = layer - 1;
+                let upper = &mut self.upper_neighbors[id as usize];
+                while upper.len() <= layer_idx {
+                    upper.push(Vec::new());
+                }
+                upper[layer_idx].clear();
+                upper[layer_idx].extend(results[..m_to_select].iter().map(|c| c.id));
+            }
 
             // Add back-edges — iterate results slice directly
             for i in 0..m_to_select {
                 let nb_id = results[i].id;
                 if nb_id == id { continue; }
 
-                // Add back-edge
-                let nb_nbs = &mut self.neighbors[nb_id as usize];
-                while nb_nbs.len() <= layer {
-                    nb_nbs.push(Vec::new());
-                }
-                nb_nbs[layer].push(id);
-
-                // Prune if over capacity: only 1 excess, so just find & remove the worst
-                if self.neighbors[nb_id as usize][layer].len() > max_conn {
-                    let nb_start = nb_id as usize * dim;
-                    let nbs_layer = &self.neighbors[nb_id as usize][layer];
-                    let mut worst_idx = 0;
-                    let mut worst_dist = f32::NEG_INFINITY;
-                    for (j, &nid) in nbs_layer.iter().enumerate() {
-                        if !self.alive[nid as usize] {
-                            // Dead nodes are worst — remove them first
-                            worst_idx = j;
-                            break;
+                // Add back-edge + prune if over capacity
+                if layer == 0 {
+                    let new_count = self.push_layer0_neighbor(nb_id, id);
+                    if new_count > max_conn {
+                        // Find worst neighbor and swap-remove
+                        let nb_start = nb_id as usize * dim;
+                        let l0_stride = self.layer0_stride();
+                        let l0_start = nb_id as usize * l0_stride;
+                        let l0_count = self.layer0_counts[nb_id as usize] as usize;
+                        let mut worst_idx = 0;
+                        let mut worst_dist = f32::NEG_INFINITY;
+                        for j in 0..l0_count {
+                            let nid = self.layer0[l0_start + j];
+                            if !self.alive[nid as usize] {
+                                worst_idx = j;
+                                break;
+                            }
+                            let nid_start = nid as usize * dim;
+                            let d = metric.distance_ord(
+                                &self.vectors[nb_start..nb_start + dim],
+                                &self.vectors[nid_start..nid_start + dim],
+                            );
+                            if d > worst_dist {
+                                worst_dist = d;
+                                worst_idx = j;
+                            }
                         }
-                        let nid_start = nid as usize * dim;
-                        let d = metric.distance(
-                            &self.vectors[nb_start..nb_start + dim],
-                            &self.vectors[nid_start..nid_start + dim],
-                        );
-                        if d > worst_dist {
-                            worst_dist = d;
-                            worst_idx = j;
-                        }
+                        self.swap_remove_layer0(nb_id, worst_idx);
                     }
-                    self.neighbors[nb_id as usize][layer].swap_remove(worst_idx);
+                } else {
+                    let layer_idx = layer - 1;
+                    let nb_upper = &mut self.upper_neighbors[nb_id as usize];
+                    while nb_upper.len() <= layer_idx {
+                        nb_upper.push(Vec::new());
+                    }
+                    nb_upper[layer_idx].push(id);
+
+                    // Prune if over capacity
+                    if self.upper_neighbors[nb_id as usize][layer_idx].len() > max_conn {
+                        let nb_start = nb_id as usize * dim;
+                        let nbs_layer = &self.upper_neighbors[nb_id as usize][layer_idx];
+                        let mut worst_idx = 0;
+                        let mut worst_dist = f32::NEG_INFINITY;
+                        for (j, &nid) in nbs_layer.iter().enumerate() {
+                            if !self.alive[nid as usize] {
+                                worst_idx = j;
+                                break;
+                            }
+                            let nid_start = nid as usize * dim;
+                            let d = metric.distance_ord(
+                                &self.vectors[nb_start..nb_start + dim],
+                                &self.vectors[nid_start..nid_start + dim],
+                            );
+                            if d > worst_dist {
+                                worst_dist = d;
+                                worst_idx = j;
+                            }
+                        }
+                        self.upper_neighbors[nb_id as usize][layer_idx].swap_remove(worst_idx);
+                    }
                 }
             }
 
@@ -500,7 +670,7 @@ impl HnswGraph {
         let results = self.search_layer(query, &[current_ep], ef, 0, metric, vt);
         results.into_iter()
             .take(k)
-            .map(|c| (c.id, c.distance))
+            .map(|c| (c.id, metric.fixup_distance(c.distance)))
             .collect()
     }
 
@@ -511,20 +681,44 @@ impl HnswGraph {
         self.alive[id as usize] = false;
         self.count -= 1;
 
-        // Remove back-edges from all neighbors
         let level = self.levels[id as usize] as usize;
-        for layer in 0..=level {
-            if layer < self.neighbors[id as usize].len() {
-                let nbs: Vec<u32> = self.neighbors[id as usize][layer].clone();
+
+        // Remove back-edges from layer-0 neighbors
+        {
+            let stride = self.layer0_stride();
+            let start = id as usize * stride;
+            let count = self.layer0_counts[id as usize] as usize;
+            let l0_nbs: Vec<u32> = self.layer0[start..start + count].to_vec();
+            for nb_id in l0_nbs {
+                // Remove `id` from nb_id's layer-0 neighbor list
+                let nb_start = nb_id as usize * stride;
+                let nb_count = self.layer0_counts[nb_id as usize] as usize;
+                for j in 0..nb_count {
+                    if self.layer0[nb_start + j] == id {
+                        // swap-remove
+                        self.layer0[nb_start + j] = self.layer0[nb_start + nb_count - 1];
+                        self.layer0_counts[nb_id as usize] = (nb_count - 1) as u16;
+                        break;
+                    }
+                }
+            }
+            self.layer0_counts[id as usize] = 0;
+        }
+
+        // Remove back-edges from upper-layer neighbors
+        for layer in 1..=level {
+            let layer_idx = layer - 1;
+            if layer_idx < self.upper_neighbors[id as usize].len() {
+                let nbs: Vec<u32> = self.upper_neighbors[id as usize][layer_idx].clone();
                 for nb_id in nbs {
                     let nb_idx = nb_id as usize;
-                    if nb_idx < self.neighbors.len() && layer < self.neighbors[nb_idx].len() {
-                        self.neighbors[nb_idx][layer].retain(|&nid| nid != id);
+                    if nb_idx < self.upper_neighbors.len() && layer_idx < self.upper_neighbors[nb_idx].len() {
+                        self.upper_neighbors[nb_idx][layer_idx].retain(|&nid| nid != id);
                     }
                 }
             }
         }
-        self.neighbors[id as usize].clear();
+        self.upper_neighbors[id as usize].clear();
 
         // Update entry point if deleted node was the entry point
         if self.entry_point == Some(id) {
@@ -543,12 +737,35 @@ impl HnswGraph {
         let mut nodes = HashMap::new();
         for (i, &a) in self.alive.iter().enumerate() {
             if a {
+                let level = self.levels[i] as usize;
+                // Reconstruct neighbors list: layer 0 from flat buffer, upper from dynamic
+                let mut all_neighbors = Vec::with_capacity(level + 1);
+
+                // Layer 0
+                let stride = self.layer0_stride();
+                let l0_start = i * stride;
+                let l0_count = self.layer0_counts[i] as usize;
+                all_neighbors.push(
+                    self.layer0[l0_start..l0_start + l0_count]
+                        .iter().map(|&n| n as u64).collect()
+                );
+
+                // Upper layers
+                for layer_idx in 0..level {
+                    if layer_idx < self.upper_neighbors[i].len() {
+                        all_neighbors.push(
+                            self.upper_neighbors[i][layer_idx]
+                                .iter().map(|&n| n as u64).collect()
+                        );
+                    } else {
+                        all_neighbors.push(Vec::new());
+                    }
+                }
+
                 nodes.insert(i as u64, HnswNodeSnapshot {
                     vector: self.vector(i as u32).to_vec(),
-                    neighbors: self.neighbors[i].iter()
-                        .map(|layer_nbs| layer_nbs.iter().map(|&n| n as u64).collect())
-                        .collect(),
-                    level: self.levels[i] as usize,
+                    neighbors: all_neighbors,
+                    level,
                 });
             }
         }
@@ -576,24 +793,42 @@ impl HnswGraph {
 
         let max_id = snap.nodes.keys().copied().max().unwrap_or(0) as usize;
         let capacity = max_id + 1;
+        let m_max0 = snap.m_max0;
 
         let mut graph = Self::new(dim, snap.m, snap.ef_construction);
-        graph.m_max0 = snap.m_max0;
+        graph.m_max0 = m_max0;
         graph.ml = snap.ml;
         graph.entry_point = snap.entry_point.map(|e| e as u32);
 
+        let stride = graph.layer0_stride();
         graph.vectors.resize(capacity * dim, 0.0);
         graph.levels.resize(capacity, 0);
-        graph.neighbors.resize_with(capacity, Vec::new);
+        graph.layer0.resize(capacity * stride, 0);
+        graph.layer0_counts.resize(capacity, 0);
+        graph.upper_neighbors.resize_with(capacity, Vec::new);
         graph.alive.resize(capacity, false);
 
         for (id, node) in snap.nodes {
             let idx = id as usize;
             graph.set_vector(id as u32, &node.vector);
             graph.levels[idx] = node.level as u8;
-            graph.neighbors[idx] = node.neighbors.iter()
-                .map(|layer| layer.iter().map(|&n| n as u32).collect())
-                .collect();
+
+            // Layer 0 → flat buffer
+            if !node.neighbors.is_empty() {
+                let l0_nbs: Vec<u32> = node.neighbors[0].iter().map(|&n| n as u32).collect();
+                let count = l0_nbs.len().min(m_max0);
+                let start = idx * stride;
+                graph.layer0[start..start + count].copy_from_slice(&l0_nbs[..count]);
+                graph.layer0_counts[idx] = count as u16;
+            }
+
+            // Upper layers → dynamic vecs
+            if node.neighbors.len() > 1 {
+                graph.upper_neighbors[idx] = node.neighbors[1..].iter()
+                    .map(|layer| layer.iter().map(|&n| n as u32).collect())
+                    .collect();
+            }
+
             graph.alive[idx] = true;
             graph.count += 1;
         }
@@ -613,8 +848,8 @@ impl HnswGraph {
         stats: &mut InsertStats,
     ) -> Vec<Candidate> {
         vt.reset();
-        let mut candidates = BinaryHeap::<std::cmp::Reverse<Candidate>>::new();
-        let mut results = BinaryHeap::<Candidate>::new();
+        vt.candidates.clear();
+        vt.results.clear();
         let mut farthest_dist = f32::MAX;
 
         for &ep_id in entry_ids {
@@ -623,51 +858,49 @@ impl HnswGraph {
             let vec = self.vector(ep_id);
             stats.sl_hash_lookup += t.elapsed();
             let t = std::time::Instant::now();
-            let d = metric.distance(query, vec);
+            let d = metric.distance_ord(query, vec);
             stats.sl_distance += t.elapsed();
             let c = Candidate { distance: d, id: ep_id };
             let t = std::time::Instant::now();
-            candidates.push(std::cmp::Reverse(c));
-            results.push(c);
+            vt.candidates.push(std::cmp::Reverse(c));
+            vt.results.push(c);
             farthest_dist = d;
             stats.sl_heap_ops += t.elapsed();
         }
 
-        while let Some(std::cmp::Reverse(closest)) = candidates.pop() {
-            if closest.distance > farthest_dist && results.len() >= ef {
+        while let Some(std::cmp::Reverse(closest)) = vt.candidates.pop() {
+            if closest.distance > farthest_dist && vt.results.len() >= ef {
                 break;
             }
 
-            let nbs = &self.neighbors[closest.id as usize];
-            if layer < nbs.len() {
-                for &nb_id in &nbs[layer] {
-                    if !vt.visit(nb_id) { continue; }
+            let nbs = self.get_neighbors(closest.id, layer);
+            for &nb_id in nbs {
+                if !vt.visit(nb_id) { continue; }
 
-                    let t = std::time::Instant::now();
-                    let vec = self.vector(nb_id);
-                    stats.sl_hash_lookup += t.elapsed();
-                    let t = std::time::Instant::now();
-                    let d = metric.distance(query, vec);
-                    stats.sl_distance += t.elapsed();
+                let t = std::time::Instant::now();
+                let vec = self.vector(nb_id);
+                stats.sl_hash_lookup += t.elapsed();
+                let t = std::time::Instant::now();
+                let d = metric.distance_ord(query, vec);
+                stats.sl_distance += t.elapsed();
 
-                    if results.len() < ef || d < farthest_dist {
-                        let c = Candidate { distance: d, id: nb_id };
-                        let t = std::time::Instant::now();
-                        candidates.push(std::cmp::Reverse(c));
-                        results.push(c);
-                        if results.len() > ef {
-                            results.pop();
-                        }
-                        if let Some(f) = results.peek() {
-                            farthest_dist = f.distance;
-                        }
-                        stats.sl_heap_ops += t.elapsed();
+                if vt.results.len() < ef || d < farthest_dist {
+                    let c = Candidate { distance: d, id: nb_id };
+                    let t = std::time::Instant::now();
+                    vt.candidates.push(std::cmp::Reverse(c));
+                    vt.results.push(c);
+                    if vt.results.len() > ef {
+                        vt.results.pop();
                     }
+                    if let Some(f) = vt.results.peek() {
+                        farthest_dist = f.distance;
+                    }
+                    stats.sl_heap_ops += t.elapsed();
                 }
             }
         }
 
-        let mut result_vec: Vec<Candidate> = results.into_vec();
+        let mut result_vec: Vec<Candidate> = vt.results.drain().collect();
         result_vec.sort_unstable();
         result_vec
     }
@@ -687,12 +920,16 @@ impl HnswGraph {
         vt.ensure_capacity(id as usize + 1);
         self.set_vector(id, vector);
         self.levels[id as usize] = new_level as u8;
-        // Pre-allocate neighbor vecs with expected capacity
-        let mut layer_vecs = Vec::with_capacity(new_level + 1);
-        for l in 0..=new_level {
-            layer_vecs.push(Vec::with_capacity(if l == 0 { self.m_max0 } else { self.m }));
+        self.layer0_counts[id as usize] = 0;
+        if new_level > 0 {
+            let mut upper_vecs = Vec::with_capacity(new_level);
+            for _ in 0..new_level {
+                upper_vecs.push(Vec::with_capacity(self.m));
+            }
+            self.upper_neighbors[id as usize] = upper_vecs;
+        } else {
+            self.upper_neighbors[id as usize] = Vec::new();
         }
-        self.neighbors[id as usize] = layer_vecs;
         self.alive[id as usize] = true;
         self.count += 1;
         stats.node_insert += t.elapsed();
@@ -707,7 +944,6 @@ impl HnswGraph {
 
         let current_max_level = self.max_level();
 
-        // Use original vector parameter directly — no clone needed
         let mut current_ep = ep_id;
         if current_max_level > new_level {
             let t = std::time::Instant::now();
@@ -728,49 +964,94 @@ impl HnswGraph {
             let t = std::time::Instant::now();
             let max_conn = self.max_neighbors(layer);
             let m_to_select = max_conn.min(results.len());
-            // Set forward edges directly
-            self.neighbors[id as usize][layer].clear();
-            self.neighbors[id as usize][layer].extend(
-                results[..m_to_select].iter().map(|c| c.id)
-            );
+
+            // Set forward edges (stack array avoids heap allocation)
+            if layer == 0 {
+                let mut ids = [0u32; 64];
+                for (i, c) in results[..m_to_select].iter().enumerate() {
+                    ids[i] = c.id;
+                }
+                self.set_layer0_neighbors(id, &ids[..m_to_select]);
+            } else {
+                let layer_idx = layer - 1;
+                let upper = &mut self.upper_neighbors[id as usize];
+                while upper.len() <= layer_idx {
+                    upper.push(Vec::new());
+                }
+                upper[layer_idx].clear();
+                upper[layer_idx].extend(results[..m_to_select].iter().map(|c| c.id));
+            }
             stats.set_neighbors += t.elapsed();
 
             for i in 0..m_to_select {
                 let nb_id = results[i].id;
                 if nb_id == id { continue; }
 
-                let t = std::time::Instant::now();
-                let nb_nbs = &mut self.neighbors[nb_id as usize];
-                while nb_nbs.len() <= layer {
-                    nb_nbs.push(Vec::new());
-                }
-                nb_nbs[layer].push(id);
-                stats.back_edges += t.elapsed();
-
-                // Prune if over capacity: swap-remove the worst
-                if self.neighbors[nb_id as usize][layer].len() > max_conn {
+                if layer == 0 {
                     let t = std::time::Instant::now();
-                    let nb_start = nb_id as usize * dim;
-                    let nbs_layer = &self.neighbors[nb_id as usize][layer];
-                    let mut worst_idx = 0;
-                    let mut worst_dist = f32::NEG_INFINITY;
-                    for (j, &nid) in nbs_layer.iter().enumerate() {
-                        if !self.alive[nid as usize] {
-                            worst_idx = j;
-                            break;
+                    let new_count = self.push_layer0_neighbor(nb_id, id);
+                    stats.back_edges += t.elapsed();
+
+                    if new_count > max_conn {
+                        let t = std::time::Instant::now();
+                        let nb_start = nb_id as usize * dim;
+                        let l0_start = nb_id as usize * self.m_max0;
+                        let l0_count = self.layer0_counts[nb_id as usize] as usize;
+                        let mut worst_idx = 0;
+                        let mut worst_dist = f32::NEG_INFINITY;
+                        for j in 0..l0_count {
+                            let nid = self.layer0[l0_start + j];
+                            if !self.alive[nid as usize] {
+                                worst_idx = j;
+                                break;
+                            }
+                            let nid_start = nid as usize * dim;
+                            let d = metric.distance_ord(
+                                &self.vectors[nb_start..nb_start + dim],
+                                &self.vectors[nid_start..nid_start + dim],
+                            );
+                            if d > worst_dist {
+                                worst_dist = d;
+                                worst_idx = j;
+                            }
                         }
-                        let nid_start = nid as usize * dim;
-                        let d = metric.distance(
-                            &self.vectors[nb_start..nb_start + dim],
-                            &self.vectors[nid_start..nid_start + dim],
-                        );
-                        if d > worst_dist {
-                            worst_dist = d;
-                            worst_idx = j;
-                        }
+                        self.swap_remove_layer0(nb_id, worst_idx);
+                        stats.pruning += t.elapsed();
                     }
-                    self.neighbors[nb_id as usize][layer].swap_remove(worst_idx);
-                    stats.pruning += t.elapsed();
+                } else {
+                    let t = std::time::Instant::now();
+                    let layer_idx = layer - 1;
+                    let nb_upper = &mut self.upper_neighbors[nb_id as usize];
+                    while nb_upper.len() <= layer_idx {
+                        nb_upper.push(Vec::new());
+                    }
+                    nb_upper[layer_idx].push(id);
+                    stats.back_edges += t.elapsed();
+
+                    if self.upper_neighbors[nb_id as usize][layer_idx].len() > max_conn {
+                        let t = std::time::Instant::now();
+                        let nb_start = nb_id as usize * dim;
+                        let nbs_layer = &self.upper_neighbors[nb_id as usize][layer_idx];
+                        let mut worst_idx = 0;
+                        let mut worst_dist = f32::NEG_INFINITY;
+                        for (j, &nid) in nbs_layer.iter().enumerate() {
+                            if !self.alive[nid as usize] {
+                                worst_idx = j;
+                                break;
+                            }
+                            let nid_start = nid as usize * dim;
+                            let d = metric.distance_ord(
+                                &self.vectors[nb_start..nb_start + dim],
+                                &self.vectors[nid_start..nid_start + dim],
+                            );
+                            if d > worst_dist {
+                                worst_dist = d;
+                                worst_idx = j;
+                            }
+                        }
+                        self.upper_neighbors[nb_id as usize][layer_idx].swap_remove(worst_idx);
+                        stats.pruning += t.elapsed();
+                    }
                 }
             }
 
@@ -911,6 +1192,37 @@ impl HnswIndex {
             self.graph.insert_instrumented(*id as u32, vec, metric, vt, &mut stats);
         }
         stats
+    }
+
+    /// Batch insert from a contiguous flat f32 buffer (row-major, N × dim).
+    /// IDs are assigned sequentially: start_id, start_id+1, ...
+    /// No per-vector allocation — reads directly from the flat slice.
+    /// This is the fastest insert path for bulk loading.
+    pub fn add_batch_raw(&mut self, data: &[f32], dim: usize, start_id: u64) -> Result<(), VectorDbError> {
+        if dim != self.config.dimensions {
+            return Err(VectorDbError::DimensionMismatch {
+                expected: self.config.dimensions,
+                got: dim,
+            });
+        }
+        if data.len() % dim != 0 {
+            return Err(VectorDbError::InvalidConfig(
+                format!("data length {} is not divisible by dimension {}", data.len(), dim),
+            ));
+        }
+        let n = data.len() / dim;
+        let max_id = start_id + n as u64 - 1;
+        let metric = self.config.metric;
+        let vt = self.visited.get_mut().unwrap();
+        self.graph.ensure_capacity(max_id as u32);
+        vt.ensure_capacity(max_id as usize + 1);
+        self.graph.reserve(n);
+        for i in 0..n {
+            let vec_slice = &data[i * dim..(i + 1) * dim];
+            let id = (start_id + i as u64) as u32;
+            self.graph.insert(id, vec_slice, metric, vt);
+        }
+        Ok(())
     }
 
     /// Set the `ef_search` parameter at runtime (no rebuild needed).

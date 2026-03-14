@@ -40,6 +40,65 @@ impl Metric {
             Metric::DotProduct => dot_product_distance(a, b),
         }
     }
+
+    /// Ordering-preserving distance for internal hot paths (HNSW).
+    ///
+    /// Returns a value whose **ordering** matches `distance()` but may differ
+    /// in absolute magnitude:
+    /// - **L2**: returns `l2_squared(a, b)` (no sqrt — sqrt is monotonic so ordering is identical)
+    /// - **Cosine / DotProduct**: identical to `distance()`
+    ///
+    /// Uses `debug_assert_eq` instead of `assert_eq` for the dimension check,
+    /// so the check is elided in release builds (saving ~1 branch per call).
+    ///
+    /// Call [`Metric::fixup_distance`] to convert back to true distance when
+    /// returning results to the caller.
+    #[inline]
+    pub fn distance_ord(self, a: &[f32], b: &[f32]) -> f32 {
+        debug_assert_eq!(a.len(), b.len(), "vector dimension mismatch");
+        match self {
+            Metric::L2 => l2_squared(a, b),
+            Metric::Cosine => cosine_distance(a, b),
+            Metric::DotProduct => dot_product_distance(a, b),
+        }
+    }
+
+    /// Compute 4 ordering-preserving distances simultaneously (ILP).
+    ///
+    /// Loads the query vector once and computes 4 distances using independent
+    /// accumulators for better CPU utilization.
+    #[inline]
+    pub fn distance_ord_batch4(self, query: &[f32], vecs: [&[f32]; 4]) -> [f32; 4] {
+        match self {
+            Metric::L2 => l2_squared_batch4(query, vecs),
+            Metric::DotProduct => {
+                let dots = dot_batch4(query, vecs);
+                [-dots[0], -dots[1], -dots[2], -dots[3]]
+            }
+            Metric::Cosine => {
+                // Cosine needs norms, fall back to individual calls
+                [
+                    cosine_distance(query, vecs[0]),
+                    cosine_distance(query, vecs[1]),
+                    cosine_distance(query, vecs[2]),
+                    cosine_distance(query, vecs[3]),
+                ]
+            }
+        }
+    }
+
+    /// Convert an ordering distance (from [`Metric::distance_ord`]) back to
+    /// the true distance that users expect.
+    ///
+    /// - **L2**: applies `sqrt()` (since `distance_ord` returned squared L2)
+    /// - **Cosine / DotProduct**: no-op (values are already correct)
+    #[inline]
+    pub fn fixup_distance(self, d: f32) -> f32 {
+        match self {
+            Metric::L2 => d.sqrt(),
+            _ => d,
+        }
+    }
 }
 
 // ── Public API ─────────────────────────────────────────────────────────────────
@@ -94,6 +153,23 @@ pub fn normalize(v: &mut [f32]) {
     }
 }
 
+// ── Batch-4 distance (ILP) ──────────────────────────────────────────────────
+
+/// Compute 4 squared L2 distances from `query` to 4 vectors simultaneously.
+///
+/// Loads query once per chunk and uses 4 independent accumulators to enable
+/// instruction-level parallelism (ILP).
+#[inline]
+pub fn l2_squared_batch4(query: &[f32], vecs: [&[f32]; 4]) -> [f32; 4] {
+    dispatch_l2_squared_batch4(query, vecs)
+}
+
+/// Compute 4 dot products from `query` to 4 vectors simultaneously.
+#[inline]
+pub fn dot_batch4(query: &[f32], vecs: [&[f32]; 4]) -> [f32; 4] {
+    dispatch_dot_batch4(query, vecs)
+}
+
 // ── Runtime dispatch ───────────────────────────────────────────────────────────
 
 #[inline(always)]
@@ -130,6 +206,37 @@ fn dispatch_dot(a: &[f32], b: &[f32]) -> f32 {
     }
     #[allow(unreachable_code)]
     scalar::dot(a, b)
+}
+
+#[inline(always)]
+fn dispatch_l2_squared_batch4(query: &[f32], vecs: [&[f32]; 4]) -> [f32; 4] {
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { aarch64::l2_squared_batch4_neon(query, vecs) };
+    }
+    // Fallback: 4 individual calls (still benefits from query cache locality)
+    #[allow(unreachable_code)]
+    [
+        scalar::l2_squared(query, vecs[0]),
+        scalar::l2_squared(query, vecs[1]),
+        scalar::l2_squared(query, vecs[2]),
+        scalar::l2_squared(query, vecs[3]),
+    ]
+}
+
+#[inline(always)]
+fn dispatch_dot_batch4(query: &[f32], vecs: [&[f32]; 4]) -> [f32; 4] {
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { aarch64::dot_batch4_neon(query, vecs) };
+    }
+    #[allow(unreachable_code)]
+    [
+        scalar::dot(query, vecs[0]),
+        scalar::dot(query, vecs[1]),
+        scalar::dot(query, vecs[2]),
+        scalar::dot(query, vecs[3]),
+    ]
 }
 
 // ── Scalar fallback ────────────────────────────────────────────────────────────
@@ -295,6 +402,95 @@ mod aarch64 {
         }
         result
     }
+
+    /// Batch-4 squared L2 distance using NEON.
+    ///
+    /// Loads the query vector once per chunk and computes 4 distances with
+    /// independent accumulators for instruction-level parallelism.
+    ///
+    /// # Safety
+    /// NEON is part of the AArch64 base ISA; always available.
+    #[target_feature(enable = "neon")]
+    pub unsafe fn l2_squared_batch4_neon(query: &[f32], vecs: [&[f32]; 4]) -> [f32; 4] {
+        let n = query.len();
+        let chunks = n / 4;
+        let mut acc0 = vdupq_n_f32(0.0);
+        let mut acc1 = vdupq_n_f32(0.0);
+        let mut acc2 = vdupq_n_f32(0.0);
+        let mut acc3 = vdupq_n_f32(0.0);
+
+        for i in 0..chunks {
+            let vq = vld1q_f32(query.as_ptr().add(i * 4));
+
+            let v0 = vld1q_f32(vecs[0].as_ptr().add(i * 4));
+            let d0 = vsubq_f32(vq, v0);
+            acc0 = vmlaq_f32(acc0, d0, d0);
+
+            let v1 = vld1q_f32(vecs[1].as_ptr().add(i * 4));
+            let d1 = vsubq_f32(vq, v1);
+            acc1 = vmlaq_f32(acc1, d1, d1);
+
+            let v2 = vld1q_f32(vecs[2].as_ptr().add(i * 4));
+            let d2 = vsubq_f32(vq, v2);
+            acc2 = vmlaq_f32(acc2, d2, d2);
+
+            let v3 = vld1q_f32(vecs[3].as_ptr().add(i * 4));
+            let d3 = vsubq_f32(vq, v3);
+            acc3 = vmlaq_f32(acc3, d3, d3);
+        }
+
+        let mut result = [vaddvq_f32(acc0), vaddvq_f32(acc1), vaddvq_f32(acc2), vaddvq_f32(acc3)];
+
+        for i in (chunks * 4)..n {
+            let q = *query.get_unchecked(i);
+            let d0 = q - *vecs[0].get_unchecked(i); result[0] += d0 * d0;
+            let d1 = q - *vecs[1].get_unchecked(i); result[1] += d1 * d1;
+            let d2 = q - *vecs[2].get_unchecked(i); result[2] += d2 * d2;
+            let d3 = q - *vecs[3].get_unchecked(i); result[3] += d3 * d3;
+        }
+        result
+    }
+
+    /// Batch-4 dot product using NEON.
+    ///
+    /// # Safety
+    /// NEON is part of the AArch64 base ISA; always available.
+    #[target_feature(enable = "neon")]
+    pub unsafe fn dot_batch4_neon(query: &[f32], vecs: [&[f32]; 4]) -> [f32; 4] {
+        let n = query.len();
+        let chunks = n / 4;
+        let mut acc0 = vdupq_n_f32(0.0);
+        let mut acc1 = vdupq_n_f32(0.0);
+        let mut acc2 = vdupq_n_f32(0.0);
+        let mut acc3 = vdupq_n_f32(0.0);
+
+        for i in 0..chunks {
+            let vq = vld1q_f32(query.as_ptr().add(i * 4));
+
+            let v0 = vld1q_f32(vecs[0].as_ptr().add(i * 4));
+            acc0 = vmlaq_f32(acc0, vq, v0);
+
+            let v1 = vld1q_f32(vecs[1].as_ptr().add(i * 4));
+            acc1 = vmlaq_f32(acc1, vq, v1);
+
+            let v2 = vld1q_f32(vecs[2].as_ptr().add(i * 4));
+            acc2 = vmlaq_f32(acc2, vq, v2);
+
+            let v3 = vld1q_f32(vecs[3].as_ptr().add(i * 4));
+            acc3 = vmlaq_f32(acc3, vq, v3);
+        }
+
+        let mut result = [vaddvq_f32(acc0), vaddvq_f32(acc1), vaddvq_f32(acc2), vaddvq_f32(acc3)];
+
+        for i in (chunks * 4)..n {
+            let q = *query.get_unchecked(i);
+            result[0] += q * *vecs[0].get_unchecked(i);
+            result[1] += q * *vecs[1].get_unchecked(i);
+            result[2] += q * *vecs[2].get_unchecked(i);
+            result[3] += q * *vecs[3].get_unchecked(i);
+        }
+        result
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -425,6 +621,54 @@ mod tests {
                 (got_dot - ref_dot).abs() < 1e-3,
                 "dot mismatch at n={n}: got {got_dot} vs {ref_dot}"
             );
+        }
+    }
+
+    /// Verify batch-4 distance matches individual calls.
+    #[test]
+    fn batch4_matches_individual() {
+        let n = 128;
+        let query: Vec<f32> = (0..n).map(|i| (i as f32 * 0.01).sin()).collect();
+        let vecs: Vec<Vec<f32>> = (0..4)
+            .map(|k| (0..n).map(|i| ((i + k * 37) as f32 * 0.01).cos()).collect())
+            .collect();
+
+        let batch_l2 = l2_squared_batch4(&query, [&vecs[0], &vecs[1], &vecs[2], &vecs[3]]);
+        let batch_dot = dot_batch4(&query, [&vecs[0], &vecs[1], &vecs[2], &vecs[3]]);
+
+        for k in 0..4 {
+            let ref_l2 = l2_squared(&query, &vecs[k]);
+            assert!(
+                (batch_l2[k] - ref_l2).abs() < 1e-2,
+                "batch4 l2 mismatch at k={k}: got {} vs {ref_l2}", batch_l2[k]
+            );
+            let ref_dot = dot(&query, &vecs[k]);
+            assert!(
+                (batch_dot[k] - ref_dot).abs() < 1e-2,
+                "batch4 dot mismatch at k={k}: got {} vs {ref_dot}", batch_dot[k]
+            );
+        }
+    }
+
+    #[test]
+    fn batch4_metric_dispatch() {
+        let n = 128;
+        let query: Vec<f32> = (0..n).map(|i| (i as f32 * 0.01).sin()).collect();
+        let vecs: Vec<Vec<f32>> = (0..4)
+            .map(|k| (0..n).map(|i| ((i + k * 37) as f32 * 0.01).cos()).collect())
+            .collect();
+        let refs = [&vecs[0][..], &vecs[1][..], &vecs[2][..], &vecs[3][..]];
+
+        for metric in [Metric::L2, Metric::DotProduct, Metric::Cosine] {
+            let batch = metric.distance_ord_batch4(&query, refs);
+            for k in 0..4 {
+                let individual = metric.distance_ord(&query, &vecs[k]);
+                assert!(
+                    (batch[k] - individual).abs() < 1e-2,
+                    "batch4 metric {:?} mismatch at k={k}: got {} vs {individual}",
+                    metric, batch[k]
+                );
+            }
         }
     }
 }
