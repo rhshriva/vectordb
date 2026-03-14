@@ -7,17 +7,24 @@ name = "quiver-vector-db"
 version = "0.1.0"
 description = "Fast embedded vector database with Python bindings"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.11"
 license = { text = "MIT" }
-keywords = ["vector", "database", "embeddings", "similarity-search", "ann"]
+keywords = ["vector", "database", "embeddings", "similarity-search", "ann", "hnsw", "faiss", "rag"]
 authors = [{ name = "Quiver contributors" }]
-urls = { Homepage = "https://github.com/rhshriva/Quiver", Repository = "https://github.com/rhshriva/Quiver" }
+urls = { Homepage = "https://github.com/rhshriva/Quiver", Repository = "https://github.com/rhshriva/Quiver", Documentation = "https://github.com/rhshriva/Quiver#readme" }
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Database",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
 ]
 
 [project.optional-dependencies]
@@ -35,3 +42,13 @@ manifest-path = "crates/quiver-python/Cargo.toml"
 module-name = "quiver_vector_db"
 features = ["pyo3/extension-module"]
 python-source = "."
+include = [
+    "quiver_vector_db/__init__.pyi",
+    "quiver_vector_db/py.typed",
+    "quiver_vector_db/__init__.py",
+    "quiver_vector_db/bm25.py",
+    "quiver_vector_db/embedding.py",
+    "quiver_vector_db/text_collection.py",
+    "quiver_vector_db/multi_collection.py",
+    "quiver_vector_db/server.py",
+]
