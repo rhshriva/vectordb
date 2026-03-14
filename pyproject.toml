@@ -4,11 +4,11 @@ build-backend = "maturin"
 
 [project]
 name = "quiver-vector-db"
-version = "0.1.0"
+version = "0.1.1"
 description = "Fast embedded vector database with Python bindings"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 keywords = ["vector", "database", "embeddings", "similarity-search", "ann", "hnsw", "faiss", "rag"]
 authors = [{ name = "Quiver contributors" }]
 urls = { Homepage = "https://github.com/rhshriva/Quiver", Repository = "https://github.com/rhshriva/Quiver", Documentation = "https://github.com/rhshriva/Quiver#readme" }
