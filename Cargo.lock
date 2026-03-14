@@ -415,7 +415,7 @@ dependencies = [
 
 [[package]]
 name = "quiver-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "approx",
  "bincode",
@@ -435,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "quiver-python"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "pyo3",
  "quiver-core",

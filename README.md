@@ -65,17 +65,16 @@ All comparisons use identical configurations (M=16, ef_construction=200, ef_sear
 
 ### Insert Throughput, Search Latency & Recall — All Index Types
 
+All HNSW benchmarks use 16 threads for insert (matching production usage).
+
 | Index | Insert (vec/s) | Search (ms) | Recall@10 |
 |---|---:|---:|---:|
 | **Quiver Flat** | 1,440K | 0.027 | 1.0000 |
 | faiss Flat | 59,480K | 0.016 | 1.0000 |
 | | | | |
-| **Quiver HNSW (1T)** | 21,163 | **0.020** | 0.9440 |
-| **Quiver HNSW (16T)** | 61,558 | 0.021 | 0.9410 |
-| hnswlib (1T) | 10,036 | 0.045 | 0.9350 |
-| hnswlib (16T) | 67,149 | 0.045 | 0.9350 |
-| faiss HNSW (1T) | 16,122 | 0.024 | 0.9510 |
-| faiss HNSW (16T) | 117,512 | 0.024 | 0.9510 |
+| **Quiver HNSW** | 61,558 | **0.020** | 0.9410 |
+| hnswlib | 67,149 | 0.045 | 0.9350 |
+| faiss HNSW | 117,512 | 0.024 | 0.9510 |
 | | | | |
 | **Quiver Int8** | 1,294K | **0.060** | 0.9940 |
 | faiss SQ8 | 5,795K | 0.094 | 0.9930 |
@@ -92,9 +91,8 @@ All comparisons use identical configurations (M=16, ef_construction=200, ef_sear
 
 **Highlights:**
 
-- **HNSW search**: Quiver is the fastest — 0.020ms vs hnswlib 0.045ms (2.3x) vs faiss 0.024ms (1.2x)
-- **HNSW insert (1T)**: Quiver 21K vs hnswlib 10K (2.1x) vs faiss 16K (1.3x faster)
-- **HNSW insert (16T)**: Quiver 62K — parallel micro-batching gives 3x single-thread speedup
+- **HNSW search**: Quiver 0.020ms vs hnswlib 0.045ms (2.3x faster) vs faiss 0.024ms (1.2x faster)
+- **HNSW insert**: Quiver 62K vs hnswlib 67K (on par) vs faiss 118K — all at 16 threads
 - **Int8 search**: Quiver 0.060ms vs faiss SQ8 0.094ms (1.6x faster)
 - **Recall parity**: Quiver matches or exceeds competitors across all index types
 
@@ -396,67 +394,6 @@ idx = quiver.BinaryFlatIndex(dimensions=384, metric="l2")
 | Dot Product | `"dot_product"` | Pre-normalized vectors |
 
 All metrics use SIMD-accelerated kernels (AVX2+FMA on x86, NEON on ARM).
-
----
-
-## API Reference
-
-### `Client(path="./data")`
-
-Persistent vector database client. Opens a directory on disk; all writes are WAL-backed.
-
-| Method | Description |
-|--------|-------------|
-| `create_collection(name, dimensions, metric, index_type)` | Create a new collection |
-| `get_collection(name)` | Get an existing collection |
-| `get_or_create_collection(name, dimensions, metric)` | Get or create |
-| `delete_collection(name)` | Delete collection and data |
-| `list_collections()` | List collection names |
-
-### `Collection`
-
-| Method | Description |
-|--------|-------------|
-| `upsert(id, vector, payload=None)` | Insert or update a vector |
-| `upsert_batch(entries)` | Batch insert `[(id, vector, payload?)]` |
-| `search(query, k, filter=None)` | Search k nearest. Returns `[{"id", "distance", "payload"}]` |
-| `upsert_hybrid(id, vector, sparse_vector, payload)` | Upsert with sparse vector |
-| `search_hybrid(dense_query, sparse_query, k, ...)` | Weighted dense+sparse search |
-| `delete(id)` | Delete by ID |
-| `create_snapshot(name)` | Snapshot current state |
-| `restore_snapshot(name)` | Restore to snapshot |
-| `list_snapshots()` | List all snapshots |
-| `delete_snapshot(name)` | Delete a snapshot |
-| `count` | Number of vectors |
-
-### `TextCollection(collection, embedding_function)`
-
-| Method | Description |
-|--------|-------------|
-| `add(ids, documents, payloads=None)` | Embed and index documents |
-| `query(text, k, mode="hybrid")` | Search by text. Modes: `"hybrid"`, `"semantic"`, `"keyword"` |
-| `delete(ids)` | Delete documents |
-
-### Embedding Functions
-
-| Class | Provider | Install |
-|-------|----------|---------|
-| `SentenceTransformerEmbedding(model)` | Local models | `pip install quiver-vector-db[sentence-transformers]` |
-| `OpenAIEmbedding(model, api_key)` | OpenAI API | `pip install quiver-vector-db[openai]` |
-
-Custom embedder:
-
-```python
-class MyEmbedder:
-    def __call__(self, texts: list[str]) -> list[list[float]]:
-        return [my_model.encode(t) for t in texts]
-
-    @property
-    def dimensions(self) -> int:
-        return 384
-```
-
----
 
 ## IDE Support
 
