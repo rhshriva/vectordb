@@ -33,7 +33,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 rand = "0.8"
 
 # Python bindings
-pyo3 = { version = "0.22", features = ["extension-module", "abi3-py311"] }
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py311", "generate-import-lib"] }
 tempfile = "3"
 
 # Binary serialization for index snapshots and WAL
