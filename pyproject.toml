@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "quiver-vector-db"
-version = "0.1.1"
+version = "0.1.2"
 description = "Fast embedded vector database with Python bindings"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -22,6 +22,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Database",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Typing :: Typed",
