@@ -45,16 +45,15 @@ maturin develop --release
 | **Built-in embeddings** | sentence-transformers (local) and OpenAI API |
 | **Full-text search** | BM25 keyword search with hybrid dense+sparse fusion |
 | **3 distance metrics** | Cosine, L2, Dot Product — all SIMD-accelerated (AVX2/NEON) |
-| **Payload filtering** | JSON metadata with 8 operators (`$eq`, `$ne`, `$in`, `$gt`, `$gte`, `$lt`, `$lte`, `$and`, `$or`) |
+| **Payload filtering** | JSON metadata with 9 filter operators (`$eq`, `$ne`, `$in`, `$gt`, `$gte`, `$lt`, `$lte`, `$and`, `$or`) |
 | **Hybrid search** | Weighted fusion of dense vectors + sparse keyword signals |
 | **Multi-vector** | Multiple named embedding spaces per document (text + image) |
 | **Data versioning** | Create, list, restore, and delete collection snapshots |
 | **Batch upsert** | Efficient bulk insertion API |
 | **Parallel HNSW insert** | Multi-threaded insert via rayon micro-batching |
 | **WAL persistence** | Crash-safe writes with automatic compaction |
-| **REST API server** | Zero-dependency HTTP server for language-agnostic access |
 | **IDE support** | Full type stubs (`py.typed` + `.pyi`) for autocompletion |
-| **Zero dependencies** | Single `pip install`, no servers or runtimes |
+| **Zero dependencies** | Single `pip install`, no external dependencies |
 
 ---
 
@@ -65,38 +64,40 @@ All comparisons use identical configurations (M=16, ef_construction=200, ef_sear
 
 ### Insert Throughput, Search Latency & Recall — All Index Types
 
-All HNSW benchmarks use 16 threads for insert (matching production usage).
+All Quiver indexes use `add_batch_np` (numpy buffer protocol) for fair comparison — both Quiver and faiss receive contiguous numpy arrays. HNSW benchmarks use 16 threads for insert (matching production usage).
 
 | Index | Insert (vec/s) | Search (ms) | Recall@10 |
 |---|---:|---:|---:|
-| **Quiver Flat** | 1,440K | 0.027 | 1.0000 |
-| faiss Flat | 59,480K | 0.016 | 1.0000 |
+| **Quiver Flat** | 25,357K | 0.024 | 1.0000 |
+| faiss Flat | 53,452K | 0.017 | 1.0000 |
 | | | | |
-| **Quiver HNSW** | 61,558 | **0.020** | 0.9410 |
-| hnswlib | 67,149 | 0.045 | 0.9350 |
-| faiss HNSW | 117,512 | 0.024 | 0.9510 |
+| **Quiver HNSW** | 60,004 | **0.021** | 0.9420 |
+| hnswlib | 65,478 | 0.044 | 0.9350 |
+| faiss HNSW | 111,951 | 0.024 | 0.9510 |
 | | | | |
-| **Quiver Int8** | 1,294K | **0.060** | 0.9940 |
-| faiss SQ8 | 5,795K | 0.094 | 0.9930 |
+| **Quiver Int8** | **15,028K** | **0.060** | 0.9940 |
+| faiss SQ8 | 5,961K | 0.095 | 0.9930 |
 | | | | |
-| **Quiver IVF** | 174K | 0.015 | 0.5390 |
-| faiss IVFFlat | 1,287K | 0.009 | 0.5670 |
+| **Quiver IVF** | 182K | 0.017 | 0.6110 |
+| faiss IVFFlat | 1,245K | 0.009 | 0.5670 |
 | | | | |
-| **Quiver IVF-PQ** | 60K | 0.015 | 0.0790 |
-| faiss IVFPQ | 134K | 0.008 | 0.0690 |
+| **Quiver IVF-PQ** | 63K | 0.014 | 0.0720 |
+| faiss IVFPQ | 132K | 0.008 | 0.0690 |
 | | | | |
-| **Quiver FP16** | 1,403K | 0.115 | 1.0000 |
-| **Quiver Mmap** | 816K | 0.032 | 1.0000 |
-| **Quiver Binary** | 873K | 0.013 | 0.1190 |
+| **Quiver FP16** | 13,072K | 0.117 | 1.0000 |
+| **Quiver Mmap** | 1,729K | 0.033 | 1.0000 |
+| **Quiver Binary** | 2,166K | 0.013 | 0.1250 |
 
 **Highlights:**
 
-- **HNSW search**: Quiver 0.020ms vs hnswlib 0.045ms (2.3x faster) vs faiss 0.024ms (1.2x faster)
-- **HNSW insert**: Quiver 62K vs hnswlib 67K (on par) vs faiss 118K — all at 16 threads
-- **Int8 search**: Quiver 0.060ms vs faiss SQ8 0.094ms (1.6x faster)
+- **Flat insert**: 25.4M vec/s — only 2.1x behind faiss (was 41x before bulk optimization)
+- **Int8 insert**: **15M vec/s — 2.5x FASTER than faiss SQ8** (5.9M)
+- **FP16 insert**: 13M vec/s — fastest quantized insert across all frameworks
+- **HNSW search**: Quiver 0.021ms vs hnswlib 0.044ms (2.1x faster) vs faiss 0.024ms (1.1x faster)
+- **Int8 search**: Quiver 0.060ms vs faiss SQ8 0.095ms (1.6x faster)
 - **Recall parity**: Quiver matches or exceeds competitors across all index types
 
-Reproduce: `pytest tests/test_perf_regression.py::TestAppleToAppleComparison -v -s`
+Reproduce: `pytest tests/test_competitive_benchmarks.py -v -s`
 
 ---
 

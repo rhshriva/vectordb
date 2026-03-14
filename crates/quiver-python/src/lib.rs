@@ -271,6 +271,17 @@ impl PyFlatIndex {
         self.inner.add_batch(&batch).map_err(vec_err_to_py)
     }
 
+    /// Add vectors from a 2D numpy array (N × dim) with sequential IDs starting from `start_id`.
+    /// This is the fastest way to insert vectors — no per-element Python extraction.
+    #[cfg(any(not(Py_LIMITED_API), Py_3_11))]
+    #[pyo3(signature = (vectors, start_id = 0))]
+    fn add_batch_np(&mut self, py: Python<'_>, vectors: &Bound<'_, PyAny>, start_id: u64) -> PyResult<()> {
+        let (data, _n_rows, n_cols) = extract_2d_f32_buffer(vectors)?;
+        py.allow_threads(|| {
+            self.inner.add_batch_raw(&data, n_cols, start_id).map_err(vec_err_to_py)
+        })
+    }
+
     /// Search for the k nearest vectors. Returns list of {"id": int, "distance": float}.
     fn search(&self, py: Python<'_>, query: &Bound<'_, PyAny>, k: usize) -> PyResult<Vec<PyObject>> {
         let q = extract_f32_vec(query)?;
@@ -466,6 +477,16 @@ impl PyQuantizedFlatIndex {
         self.inner.add_batch(&batch).map_err(vec_err_to_py)
     }
 
+    /// Add vectors from a 2D numpy array (N × dim) with sequential IDs starting from `start_id`.
+    #[cfg(any(not(Py_LIMITED_API), Py_3_11))]
+    #[pyo3(signature = (vectors, start_id = 0))]
+    fn add_batch_np(&mut self, py: Python<'_>, vectors: &Bound<'_, PyAny>, start_id: u64) -> PyResult<()> {
+        let (data, _n_rows, n_cols) = extract_2d_f32_buffer(vectors)?;
+        py.allow_threads(|| {
+            self.inner.add_batch_raw(&data, n_cols, start_id).map_err(vec_err_to_py)
+        })
+    }
+
     fn search(&self, py: Python<'_>, query: &Bound<'_, PyAny>, k: usize) -> PyResult<Vec<PyObject>> {
         let q = extract_f32_vec(query)?;
         let results = py.allow_threads(|| self.inner.search(&q, k)).map_err(vec_err_to_py)?;
@@ -529,6 +550,16 @@ impl PyFp16FlatIndex {
     fn add_batch(&mut self, entries: &Bound<'_, PyList>) -> PyResult<()> {
         let batch = extract_batch_entries(entries)?;
         self.inner.add_batch(&batch).map_err(vec_err_to_py)
+    }
+
+    /// Add vectors from a 2D numpy array (N × dim) with sequential IDs starting from `start_id`.
+    #[cfg(any(not(Py_LIMITED_API), Py_3_11))]
+    #[pyo3(signature = (vectors, start_id = 0))]
+    fn add_batch_np(&mut self, py: Python<'_>, vectors: &Bound<'_, PyAny>, start_id: u64) -> PyResult<()> {
+        let (data, _n_rows, n_cols) = extract_2d_f32_buffer(vectors)?;
+        py.allow_threads(|| {
+            self.inner.add_batch_raw(&data, n_cols, start_id).map_err(vec_err_to_py)
+        })
     }
 
     fn search(&self, py: Python<'_>, query: &Bound<'_, PyAny>, k: usize) -> PyResult<Vec<PyObject>> {
@@ -601,6 +632,16 @@ impl PyIvfIndex {
     fn add_batch(&mut self, entries: &Bound<'_, PyList>) -> PyResult<()> {
         let batch = extract_batch_entries(entries)?;
         self.inner.add_batch(&batch).map_err(vec_err_to_py)
+    }
+
+    /// Add vectors from a 2D numpy array (N × dim) with sequential IDs starting from `start_id`.
+    #[cfg(any(not(Py_LIMITED_API), Py_3_11))]
+    #[pyo3(signature = (vectors, start_id = 0))]
+    fn add_batch_np(&mut self, py: Python<'_>, vectors: &Bound<'_, PyAny>, start_id: u64) -> PyResult<()> {
+        let (data, _n_rows, n_cols) = extract_2d_f32_buffer(vectors)?;
+        py.allow_threads(|| {
+            self.inner.add_batch_raw(&data, n_cols, start_id).map_err(vec_err_to_py)
+        })
     }
 
     fn search(&self, py: Python<'_>, query: &Bound<'_, PyAny>, k: usize) -> PyResult<Vec<PyObject>> {
@@ -689,6 +730,16 @@ impl PyIvfPqIndex {
         self.inner.add_batch(&batch).map_err(vec_err_to_py)
     }
 
+    /// Add vectors from a 2D numpy array (N × dim) with sequential IDs starting from `start_id`.
+    #[cfg(any(not(Py_LIMITED_API), Py_3_11))]
+    #[pyo3(signature = (vectors, start_id = 0))]
+    fn add_batch_np(&mut self, py: Python<'_>, vectors: &Bound<'_, PyAny>, start_id: u64) -> PyResult<()> {
+        let (data, _n_rows, n_cols) = extract_2d_f32_buffer(vectors)?;
+        py.allow_threads(|| {
+            self.inner.add_batch_raw(&data, n_cols, start_id).map_err(vec_err_to_py)
+        })
+    }
+
     fn search(&self, py: Python<'_>, query: &Bound<'_, PyAny>, k: usize) -> PyResult<Vec<PyObject>> {
         let q = extract_f32_vec(query)?;
         let results = py.allow_threads(|| self.inner.search(&q, k)).map_err(vec_err_to_py)?;
@@ -763,6 +814,16 @@ impl PyMmapFlatIndex {
         self.inner.add_batch(&batch).map_err(vec_err_to_py)
     }
 
+    /// Add vectors from a 2D numpy array (N × dim) with sequential IDs starting from `start_id`.
+    #[cfg(any(not(Py_LIMITED_API), Py_3_11))]
+    #[pyo3(signature = (vectors, start_id = 0))]
+    fn add_batch_np(&mut self, py: Python<'_>, vectors: &Bound<'_, PyAny>, start_id: u64) -> PyResult<()> {
+        let (data, _n_rows, n_cols) = extract_2d_f32_buffer(vectors)?;
+        py.allow_threads(|| {
+            self.inner.add_batch_raw(&data, n_cols, start_id).map_err(vec_err_to_py)
+        })
+    }
+
     fn search(&self, py: Python<'_>, query: &Bound<'_, PyAny>, k: usize) -> PyResult<Vec<PyObject>> {
         let q = extract_f32_vec(query)?;
         let results = py.allow_threads(|| self.inner.search(&q, k)).map_err(vec_err_to_py)?;
@@ -822,6 +883,16 @@ impl PyBinaryFlatIndex {
     fn add_batch(&mut self, entries: &Bound<'_, PyList>) -> PyResult<()> {
         let batch = extract_batch_entries(entries)?;
         self.inner.add_batch(&batch).map_err(vec_err_to_py)
+    }
+
+    /// Add vectors from a 2D numpy array (N × dim) with sequential IDs starting from `start_id`.
+    #[cfg(any(not(Py_LIMITED_API), Py_3_11))]
+    #[pyo3(signature = (vectors, start_id = 0))]
+    fn add_batch_np(&mut self, py: Python<'_>, vectors: &Bound<'_, PyAny>, start_id: u64) -> PyResult<()> {
+        let (data, _n_rows, n_cols) = extract_2d_f32_buffer(vectors)?;
+        py.allow_threads(|| {
+            self.inner.add_batch_raw(&data, n_cols, start_id).map_err(vec_err_to_py)
+        })
     }
 
     fn search(&self, py: Python<'_>, query: &Bound<'_, PyAny>, k: usize) -> PyResult<Vec<PyObject>> {

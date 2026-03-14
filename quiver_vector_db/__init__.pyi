@@ -42,6 +42,18 @@ class FlatIndex:
         """
         ...
 
+    def add_batch_np(self, vectors: Any, start_id: int = 0) -> None:
+        """Add vectors from a 2D numpy array (N x dim) with sequential IDs.
+
+        This is the fastest single-threaded insert method — passes contiguous
+        memory directly to Rust with zero per-element Python overhead.
+
+        Args:
+            vectors: 2D numpy array of shape (N, dim), dtype float32.
+            start_id: First ID to assign (default 0). IDs are start_id..start_id+N-1.
+        """
+        ...
+
     def search(self, query: List[float], k: int) -> List[Dict[str, Any]]:
         """Search for the k nearest vectors.
 
@@ -193,6 +205,19 @@ class QuantizedFlatIndex:
 
     def add(self, id: int, vector: List[float]) -> None: ...
     def add_batch(self, entries: List[Tuple[int, List[float]]]) -> None: ...
+
+    def add_batch_np(self, vectors: Any, start_id: int = 0) -> None:
+        """Add vectors from a 2D numpy array (N x dim) with sequential IDs.
+
+        This is the fastest single-threaded insert method — passes contiguous
+        memory directly to Rust with zero per-element Python overhead.
+
+        Args:
+            vectors: 2D numpy array of shape (N, dim), dtype float32.
+            start_id: First ID to assign (default 0). IDs are start_id..start_id+N-1.
+        """
+        ...
+
     def search(self, query: List[float], k: int) -> List[Dict[str, Any]]: ...
     def delete(self, id: int) -> bool: ...
     def save(self, path: str) -> None: ...
@@ -221,6 +246,19 @@ class Fp16FlatIndex:
 
     def add(self, id: int, vector: List[float]) -> None: ...
     def add_batch(self, entries: List[Tuple[int, List[float]]]) -> None: ...
+
+    def add_batch_np(self, vectors: Any, start_id: int = 0) -> None:
+        """Add vectors from a 2D numpy array (N x dim) with sequential IDs.
+
+        This is the fastest single-threaded insert method — passes contiguous
+        memory directly to Rust with zero per-element Python overhead.
+
+        Args:
+            vectors: 2D numpy array of shape (N, dim), dtype float32.
+            start_id: First ID to assign (default 0). IDs are start_id..start_id+N-1.
+        """
+        ...
+
     def search(self, query: List[float], k: int) -> List[Dict[str, Any]]: ...
     def delete(self, id: int) -> bool: ...
     def save(self, path: str) -> None: ...
@@ -261,6 +299,19 @@ class IvfIndex:
 
     def add(self, id: int, vector: List[float]) -> None: ...
     def add_batch(self, entries: List[Tuple[int, List[float]]]) -> None: ...
+
+    def add_batch_np(self, vectors: Any, start_id: int = 0) -> None:
+        """Add vectors from a 2D numpy array (N x dim) with sequential IDs.
+
+        This is the fastest single-threaded insert method — passes contiguous
+        memory directly to Rust with zero per-element Python overhead.
+
+        Args:
+            vectors: 2D numpy array of shape (N, dim), dtype float32.
+            start_id: First ID to assign (default 0). IDs are start_id..start_id+N-1.
+        """
+        ...
+
     def search(self, query: List[float], k: int) -> List[Dict[str, Any]]: ...
     def delete(self, id: int) -> bool: ...
     def flush(self) -> None: ...
@@ -307,6 +358,19 @@ class IvfPqIndex:
 
     def add(self, id: int, vector: List[float]) -> None: ...
     def add_batch(self, entries: List[Tuple[int, List[float]]]) -> None: ...
+
+    def add_batch_np(self, vectors: Any, start_id: int = 0) -> None:
+        """Add vectors from a 2D numpy array (N x dim) with sequential IDs.
+
+        This is the fastest single-threaded insert method — passes contiguous
+        memory directly to Rust with zero per-element Python overhead.
+
+        Args:
+            vectors: 2D numpy array of shape (N, dim), dtype float32.
+            start_id: First ID to assign (default 0). IDs are start_id..start_id+N-1.
+        """
+        ...
+
     def search(self, query: List[float], k: int) -> List[Dict[str, Any]]: ...
     def delete(self, id: int) -> bool: ...
     def flush(self) -> None: ...
@@ -338,6 +402,19 @@ class MmapFlatIndex:
 
     def add(self, id: int, vector: List[float]) -> None: ...
     def add_batch(self, entries: List[Tuple[int, List[float]]]) -> None: ...
+
+    def add_batch_np(self, vectors: Any, start_id: int = 0) -> None:
+        """Add vectors from a 2D numpy array (N x dim) with sequential IDs.
+
+        This is the fastest single-threaded insert method — passes contiguous
+        memory directly to Rust with zero per-element Python overhead.
+
+        Args:
+            vectors: 2D numpy array of shape (N, dim), dtype float32.
+            start_id: First ID to assign (default 0). IDs are start_id..start_id+N-1.
+        """
+        ...
+
     def search(self, query: List[float], k: int) -> List[Dict[str, Any]]: ...
     def delete(self, id: int) -> bool: ...
     def flush(self) -> None: ...
@@ -363,6 +440,19 @@ class BinaryFlatIndex:
 
     def add(self, id: int, vector: List[float]) -> None: ...
     def add_batch(self, entries: List[Tuple[int, List[float]]]) -> None: ...
+
+    def add_batch_np(self, vectors: Any, start_id: int = 0) -> None:
+        """Add vectors from a 2D numpy array (N x dim) with sequential IDs.
+
+        This is the fastest single-threaded insert method — passes contiguous
+        memory directly to Rust with zero per-element Python overhead.
+
+        Args:
+            vectors: 2D numpy array of shape (N, dim), dtype float32.
+            start_id: First ID to assign (default 0). IDs are start_id..start_id+N-1.
+        """
+        ...
+
     def search(self, query: List[float], k: int) -> List[Dict[str, Any]]: ...
     def delete(self, id: int) -> bool: ...
     def save(self, path: str) -> None: ...
