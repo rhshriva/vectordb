@@ -186,6 +186,29 @@ impl IvfIndex {
         self.id_to_list.insert(id, c);
         self.posting_lists[c].push((id, vec));
     }
+
+    /// Bulk-insert from a contiguous f32 buffer (row-major, `n_rows × dim`).
+    /// Assigns sequential IDs starting from `start_id`.
+    pub fn add_batch_raw(&mut self, raw_data: &[f32], dim: usize, start_id: u64) -> Result<(), VectorDbError> {
+        if dim != self.config.dimensions {
+            return Err(VectorDbError::DimensionMismatch {
+                expected: self.config.dimensions,
+                got: dim,
+            });
+        }
+        if raw_data.len() % dim != 0 {
+            return Err(VectorDbError::InvalidConfig(
+                format!("raw_data length {} is not a multiple of dim {}", raw_data.len(), dim),
+            ));
+        }
+        let n = raw_data.len() / dim;
+        for i in 0..n {
+            let slice = &raw_data[i * dim..(i + 1) * dim];
+            let id = start_id + i as u64;
+            self.add(id, slice)?;
+        }
+        Ok(())
+    }
 }
 
 impl VectorIndex for IvfIndex {
