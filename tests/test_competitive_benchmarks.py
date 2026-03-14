@@ -1,7 +1,8 @@
-"""Competitive benchmarks: Quiver vs faiss/hnswlib — apple-to-apple comparison.
+"""Competitive benchmarks: Quiver vs faiss/hnswlib/chromadb — apple-to-apple comparison.
 
 Measures insert throughput, search latency, and recall@10 for every Quiver
-index type against its faiss equivalent (when available).
+index type against its faiss equivalent (when available), plus hnswlib and
+chromadb for HNSW comparisons.
 
 Uses add_batch_np (numpy buffer protocol) for all Quiver indexes to make the
 comparison fair — both Quiver and faiss receive contiguous numpy arrays.
@@ -10,7 +11,7 @@ Run:
     pytest tests/test_competitive_benchmarks.py -v -s
 
 Install competitors for full comparison:
-    pip install hnswlib faiss-cpu numpy
+    pip install hnswlib faiss-cpu chromadb numpy
 """
 
 import os
@@ -113,7 +114,7 @@ def gt(vectors_np, queries_np):
 # ---------------------------------------------------------------------------
 
 class TestCompetitiveBenchmarks:
-    """Apple-to-apple benchmark: every Quiver index vs its faiss equivalent.
+    """Apple-to-apple benchmark: every Quiver index vs faiss/hnswlib/chromadb.
 
     Uses add_batch_np (numpy buffer protocol) for all Quiver indexes so that
     both Quiver and faiss receive contiguous numpy arrays — a fair comparison.
@@ -126,6 +127,7 @@ class TestCompetitiveBenchmarks:
         Quiver FlatIndex        <-> faiss IndexFlatL2         (exact brute-force)
         Quiver HnswIndex        <-> faiss IndexHNSWFlat       (M=16, ef_c=200, ef_s=50)
                                 <-> hnswlib                   (same params)
+                                <-> chromadb                  (same HNSW params)
         Quiver QuantizedFlat    <-> faiss IndexScalarQuantizer (QT_8bit)
         Quiver IvfIndex         <-> faiss IndexIVFFlat        (nlist=32, nprobe=8)
         Quiver IvfPqIndex       <-> faiss IndexIVFPQ          (nlist=32, nprobe=8, m=8, nbits=4)
@@ -275,6 +277,39 @@ class TestCompetitiveBenchmarks:
                           f"{h_lat:.3f}", f"{h_rec:.4f}"))
         else:
             rows.append(("hnswlib", "SKIP", "SKIP", "SKIP"))
+
+        # chromadb (HNSW-only vector DB)
+        chromadb = try_import("chromadb")
+        if chromadb:
+            client = chromadb.Client()
+            chroma_col = client.create_collection(
+                "bench_competitive",
+                metadata={
+                    "hnsw:M": self.BENCH_M,
+                    "hnsw:construction_ef": self.BENCH_EF_CONSTRUCTION,
+                    "hnsw:search_ef": self.BENCH_EF_SEARCH,
+                })
+            str_ids = [str(i) for i in range(N)]
+            t0 = time.perf_counter()
+            batch = 5000
+            for start in range(0, N, batch):
+                end = min(start + batch, N)
+                chroma_col.add(ids=str_ids[start:end],
+                               embeddings=vectors_list[start:end])
+            chroma_insert = N / (time.perf_counter() - t0)
+
+            lats, pred = [], []
+            for q in queries_list:
+                t0 = time.perf_counter()
+                r = chroma_col.query(query_embeddings=[q], n_results=K)
+                lats.append((time.perf_counter() - t0) * 1000)
+                pred.append([int(x) for x in r["ids"][0]])
+            chroma_lat = statistics.mean(lats)
+            chroma_rec = compute_recall(pred, gt)
+            rows.append(("ChromaDB", f"{chroma_insert:,.0f}",
+                          f"{chroma_lat:.3f}", f"{chroma_rec:.4f}"))
+        else:
+            rows.append(("ChromaDB", "SKIP", "SKIP", "SKIP"))
 
         # faiss HNSW
         if faiss:
