@@ -6,7 +6,7 @@
 <p align="center">
   <a href="https://pypi.org/project/quiver-vector-db/"><img src="https://img.shields.io/pypi/v/quiver-vector-db?color=blue" alt="PyPI"></a>
   <a href="https://pypi.org/project/quiver-vector-db/"><img src="https://img.shields.io/pypi/pyversions/quiver-vector-db" alt="Python"></a>
-  <a href="https://github.com/rhshriva/Quiver/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License"></a>
+  <a href="https://github.com/rhshriva/Quiver/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-green" alt="License"></a>
 </p>
 
 ---
@@ -317,11 +317,19 @@ python -m quiver_vector_db.server --port 8080 --data ./my_data
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `PUT` | `/collections/{name}` | Create collection |
+| `GET` | `/healthz` | Health check |
 | `GET` | `/collections` | List collections |
-| `POST` | `/collections/{name}/upsert` | Insert/update vector |
-| `POST` | `/collections/{name}/search` | Search vectors |
-| `DELETE` | `/collections/{name}/vectors/{id}` | Delete vector |
+| `POST` | `/collections` | Create collection (`{"name", "dimensions", "metric"}`) |
+| `DELETE` | `/collections/{name}` | Delete collection |
+| `POST` | `/collections/{name}/upsert` | Upsert vector (`{"id", "vector", "payload"}`) |
+| `POST` | `/collections/{name}/upsert_batch` | Batch upsert (`{"entries": [...]}`) |
+| `POST` | `/collections/{name}/search` | Search vectors (`{"query", "k", "filter"}`) |
+| `POST` | `/collections/{name}/delete` | Delete vector (`{"id"}`) |
+| `GET` | `/collections/{name}/count` | Get vector count |
+| `POST` | `/collections/{name}/snapshots` | Create snapshot |
+| `GET` | `/collections/{name}/snapshots` | List snapshots |
+| `POST` | `/collections/{name}/snapshots/restore` | Restore snapshot |
+| `DELETE` | `/collections/{name}/snapshots/{snap}` | Delete snapshot |
 
 ### 10. BM25 Standalone
 
@@ -489,4 +497,4 @@ pytest tests/test_perf_regression.py -v -s
 
 ## License
 
-MIT
+Apache 2.0 — see [LICENSE](LICENSE) for details.
