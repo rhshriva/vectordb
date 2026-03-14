@@ -1,6 +1,12 @@
 name: Publish to PyPI
 
 on:
+  # Automatic: build + publish when a version tag is pushed to main
+  push:
+    tags:
+      - "v*"
+
+  # Manual: dispatch from main only (e.g. for TestPyPI dry-runs)
   workflow_dispatch:
     inputs:
       test_pypi:
@@ -12,8 +18,21 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Guard: abort if not on main (workflow_dispatch can be triggered from any branch)
+  guard:
+    name: Verify branch is main
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check branch
+        run: |
+          if [[ "${{ github.ref }}" != "refs/heads/main" && "${{ github.ref }}" != refs/tags/v* ]]; then
+            echo "::error::Publish workflow must run from main branch or a version tag. Current ref: ${{ github.ref }}"
+            exit 1
+          fi
+
   test:
     name: Run tests
+    needs: guard
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -29,14 +48,21 @@ jobs:
     strategy:
       matrix:
         include:
+          # Linux
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
+          # macOS
           - os: macos-latest
             target: aarch64-apple-darwin
           - os: macos-latest
             target: x86_64-apple-darwin
+          # Windows
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
