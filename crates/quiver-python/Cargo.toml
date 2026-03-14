@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 description = "Python bindings for Quiver"
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(Py_LIMITED_API)', 'cfg(Py_3_11)'] }
+
 [lib]
 name = "quiver_vector_db"
 crate-type = ["cdylib"]
