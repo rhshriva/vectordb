@@ -50,4 +50,4 @@ jobs:
       - name: Install and verify
         run: |
           pip install target/wheels/quiver_vector_db-*.whl
-          python -c "import quiver_vector_db; print('OK:', dir(quiver_vector_db))"
+          cd /tmp && python -c "import quiver_vector_db; print('OK:', dir(quiver_vector_db))"
