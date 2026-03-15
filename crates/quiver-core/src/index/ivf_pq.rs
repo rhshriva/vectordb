@@ -35,7 +35,7 @@ use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    distance::Metric,
+    distance::{self, Metric},
     error::VectorDbError,
     index::{IndexConfig, SearchResult, VectorIndex},
 };
@@ -65,7 +65,7 @@ impl Default for IvfPqConfig {
             n_lists: 256,
             nprobe: 16,
             train_size: 4096,
-            max_iter: 25,
+            max_iter: 10,
             pq: PqConfig::default(),
         }
     }
@@ -78,8 +78,12 @@ struct IvfPqSnapshot {
     dimensions: usize,
     metric: Metric,
     config: IvfPqConfig,
-    staging: Vec<(u64, Vec<f32>)>,
-    centroids: Vec<Vec<f32>>,
+    // Contiguous staging buffer
+    staging_ids: Vec<u64>,
+    staging_data: Vec<f32>,
+    // Contiguous centroid data
+    centroid_data: Vec<f32>,
+    nlist: usize,
     codebook: Option<PqCodebook>,
     posting_lists: Vec<Vec<(u64, PqCode)>>,
     originals: Vec<(u64, Vec<f32>)>,
@@ -97,11 +101,15 @@ pub struct IvfPqIndex {
     config: IndexConfig,
     ivf_pq_config: IvfPqConfig,
 
-    /// Pre-training staging buffer.
-    staging: HashMap<u64, Vec<f32>>,
+    /// Pre-training staging buffer — contiguous storage.
+    staging_ids: Vec<u64>,
+    staging_data: Vec<f32>,
 
-    /// Coarse centroids (trained via k-means).
-    centroids: Vec<Vec<f32>>,
+    /// Contiguous centroid vectors: `[c0_f32s | c1_f32s | ...]`, length = nlist * dim.
+    centroid_data: Vec<f32>,
+
+    /// Number of centroids.
+    nlist: usize,
 
     /// Trained PQ codebook for residual encoding.
     codebook: Option<PqCodebook>,
@@ -125,8 +133,10 @@ impl IvfPqIndex {
         Self {
             config: IndexConfig { dimensions, metric },
             ivf_pq_config: config,
-            staging: HashMap::new(),
-            centroids: Vec::new(),
+            staging_ids: Vec::new(),
+            staging_data: Vec::new(),
+            centroid_data: Vec::new(),
+            nlist: 0,
             codebook: None,
             posting_lists: Vec::new(),
             originals: HashMap::new(),
@@ -141,8 +151,10 @@ impl IvfPqIndex {
             dimensions: self.config.dimensions,
             metric: self.config.metric,
             config: self.ivf_pq_config.clone(),
-            staging: self.staging.iter().map(|(&id, v)| (id, v.clone())).collect(),
-            centroids: self.centroids.clone(),
+            staging_ids: self.staging_ids.clone(),
+            staging_data: self.staging_data.clone(),
+            centroid_data: self.centroid_data.clone(),
+            nlist: self.nlist,
             codebook: self.codebook.clone(),
             posting_lists: self.posting_lists.clone(),
             originals: self.originals.iter().map(|(&id, v)| (id, v.clone())).collect(),
@@ -167,8 +179,10 @@ impl IvfPqIndex {
                 metric: snap.metric,
             },
             ivf_pq_config: snap.config,
-            staging: snap.staging.into_iter().collect(),
-            centroids: snap.centroids,
+            staging_ids: snap.staging_ids,
+            staging_data: snap.staging_data,
+            centroid_data: snap.centroid_data,
+            nlist: snap.nlist,
             codebook: snap.codebook,
             posting_lists: snap.posting_lists,
             originals: snap.originals.into_iter().collect(),
@@ -177,46 +191,108 @@ impl IvfPqIndex {
         })
     }
 
+    // ── Centroid access ────────────────────────────────────────────────────────
+
+    #[inline]
+    fn centroid(&self, idx: usize) -> &[f32] {
+        let dim = self.config.dimensions;
+        &self.centroid_data[idx * dim..(idx + 1) * dim]
+    }
+
+    // ── Nearest centroid (batch4 SIMD) ─────────────────────────────────────────
+
+    #[inline]
+    fn nearest_centroid(&self, vector: &[f32]) -> usize {
+        let nlist = self.nlist;
+        let dim = self.config.dimensions;
+        let metric = self.config.metric;
+
+        let mut best_idx = 0;
+        let mut best_dist = f32::MAX;
+
+        let chunks = nlist / 4;
+        for chunk in 0..chunks {
+            let base = chunk * 4;
+            let dists = metric.distance_ord_batch4(
+                vector,
+                [
+                    &self.centroid_data[base * dim..(base + 1) * dim],
+                    &self.centroid_data[(base + 1) * dim..(base + 2) * dim],
+                    &self.centroid_data[(base + 2) * dim..(base + 3) * dim],
+                    &self.centroid_data[(base + 3) * dim..(base + 4) * dim],
+                ],
+            );
+            for (j, &d) in dists.iter().enumerate() {
+                if d < best_dist {
+                    best_dist = d;
+                    best_idx = base + j;
+                }
+            }
+        }
+
+        for i in (chunks * 4)..nlist {
+            let d = metric.distance_ord(vector, self.centroid(i));
+            if d < best_dist {
+                best_dist = d;
+                best_idx = i;
+            }
+        }
+
+        best_idx
+    }
+
     // ── Training ─────────────────────────────────────────────────────────────
 
     /// Run IVF k-means + PQ codebook training on the staging buffer.
     fn train(&mut self) {
-        if self.staging.is_empty() {
+        let n = self.staging_ids.len();
+        if n == 0 {
             return;
         }
 
-        let vectors: Vec<(u64, Vec<f32>)> = self.staging.drain().collect();
-        let k = self.ivf_pq_config.n_lists.min(vectors.len());
+        let k = self.ivf_pq_config.n_lists.min(n);
+        let dim = self.config.dimensions;
 
-        // Step 1: Train IVF coarse centroids.
-        self.centroids = kmeans_vectors(&vectors, k, self.config.metric, self.ivf_pq_config.max_iter);
-        self.posting_lists = vec![Vec::new(); self.centroids.len()];
+        // Step 1: Train IVF coarse centroids — returns centroids + assignments.
+        let (centroid_data, km_assignments) = kmeans_contiguous(
+            &self.staging_data, n, k, dim, self.config.metric, self.ivf_pq_config.max_iter,
+        );
+        self.centroid_data = centroid_data;
+        self.nlist = k;
+        self.posting_lists = vec![Vec::new(); k];
 
-        // Step 2: Compute residuals for PQ training.
-        let mut assignments: Vec<(usize, Vec<f32>)> = Vec::with_capacity(vectors.len());
-        for (_, vec) in &vectors {
-            let c = nearest_centroid(&self.centroids, vec, self.config.metric);
+        // Step 2: Compute residuals for PQ training using k-means assignments.
+        let mut residuals: Vec<Vec<f32>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let c = km_assignments[i];
+            let vec = &self.staging_data[i * dim..(i + 1) * dim];
+            let centroid = self.centroid(c);
             let residual: Vec<f32> = vec
                 .iter()
-                .zip(self.centroids[c].iter())
-                .map(|(v, c)| v - c)
+                .zip(centroid.iter())
+                .map(|(v, cent)| v - cent)
                 .collect();
-            assignments.push((c, residual));
+            residuals.push(residual);
         }
 
         // Step 3: Train PQ codebook on residuals.
-        let residual_refs: Vec<&[f32]> = assignments.iter().map(|(_, r)| r.as_slice()).collect();
+        let residual_refs: Vec<&[f32]> = residuals.iter().map(|r| r.as_slice()).collect();
         let codebook = PqCodebook::train(&residual_refs, &self.ivf_pq_config.pq);
 
         // Step 4: Encode all vectors and assign to posting lists.
-        for (idx, (id, vec)) in vectors.iter().enumerate() {
-            let (c, residual) = &assignments[idx];
-            let code = codebook.encode(residual);
-            self.id_to_list.insert(*id, *c);
-            self.posting_lists[*c].push((*id, code));
-            self.originals.insert(*id, vec.clone());
+        self.id_to_list.reserve(n);
+        for i in 0..n {
+            let id = self.staging_ids[i];
+            let c = km_assignments[i];
+            let code = codebook.encode(&residuals[i]);
+            self.id_to_list.insert(id, c);
+            self.posting_lists[c].push((id, code));
+            self.originals.insert(id, self.staging_data[i * dim..(i + 1) * dim].to_vec());
         }
 
+        // Clear staging
+        self.staging_ids.clear();
+        self.staging_data.clear();
         self.codebook = Some(codebook);
         self.trained = true;
     }
@@ -246,10 +322,11 @@ impl IvfPqIndex {
 
     /// Assign a single vector to its nearest centroid with PQ encoding.
     fn assign_to_centroid(&mut self, id: u64, vec: Vec<f32>) {
-        let c = nearest_centroid(&self.centroids, &vec, self.config.metric);
+        let c = self.nearest_centroid(&vec);
+        let centroid = self.centroid(c);
         let residual: Vec<f32> = vec
             .iter()
-            .zip(self.centroids[c].iter())
+            .zip(centroid.iter())
             .map(|(v, cent)| v - cent)
             .collect();
         let code = self.codebook.as_ref().unwrap().encode(&residual);
@@ -271,8 +348,9 @@ impl VectorIndex for IvfPqIndex {
         if self.trained {
             self.assign_to_centroid(id, vector.to_vec());
         } else {
-            self.staging.insert(id, vector.to_vec());
-            if self.staging.len() >= self.ivf_pq_config.train_size {
+            self.staging_ids.push(id);
+            self.staging_data.extend_from_slice(vector);
+            if self.staging_ids.len() >= self.ivf_pq_config.train_size {
                 self.train();
             }
         }
@@ -293,32 +371,52 @@ impl VectorIndex for IvfPqIndex {
         let metric = self.config.metric;
         let mut candidates: Vec<SearchResult> = Vec::new();
 
-        if !self.trained || self.centroids.is_empty() {
+        if !self.trained || self.nlist == 0 {
             // Fall back to brute-force over staging.
-            candidates.extend(self.staging.iter().map(|(&id, v)| SearchResult {
+            let dim = self.config.dimensions;
+            candidates.extend(self.staging_ids.iter().enumerate().map(|(i, &id)| SearchResult {
                 id,
-                distance: metric.distance(query, v),
+                distance: metric.distance(query, &self.staging_data[i * dim..(i + 1) * dim]),
             }));
         } else {
             let codebook = self.codebook.as_ref().unwrap();
-            let nprobe = self.ivf_pq_config.nprobe.min(self.centroids.len());
+            let nprobe = self.ivf_pq_config.nprobe.min(self.nlist);
+            let nlist = self.nlist;
+            let dim = self.config.dimensions;
 
-            // Score all centroids and pick top-nprobe.
-            let mut centroid_scores: Vec<(usize, f32)> = self
-                .centroids
-                .iter()
-                .enumerate()
-                .map(|(i, c)| (i, metric.distance(query, c)))
-                .collect();
+            // Score all centroids using batch4 and pick top-nprobe.
+            let mut centroid_scores: Vec<(usize, f32)> = Vec::with_capacity(nlist);
+
+            let chunks = nlist / 4;
+            for chunk in 0..chunks {
+                let base = chunk * 4;
+                let dists = metric.distance_ord_batch4(
+                    query,
+                    [
+                        &self.centroid_data[base * dim..(base + 1) * dim],
+                        &self.centroid_data[(base + 1) * dim..(base + 2) * dim],
+                        &self.centroid_data[(base + 2) * dim..(base + 3) * dim],
+                        &self.centroid_data[(base + 3) * dim..(base + 4) * dim],
+                    ],
+                );
+                for (j, &d) in dists.iter().enumerate() {
+                    centroid_scores.push((base + j, d));
+                }
+            }
+            for i in (chunks * 4)..nlist {
+                centroid_scores.push((i, metric.distance_ord(query, self.centroid(i))));
+            }
+
             centroid_scores.sort_unstable_by(|a, b| {
                 a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
             });
 
             // For each probed centroid, compute residual query + ADC scan.
             for &(c, _) in centroid_scores.iter().take(nprobe) {
+                let centroid = self.centroid(c);
                 let residual_query: Vec<f32> = query
                     .iter()
-                    .zip(self.centroids[c].iter())
+                    .zip(centroid.iter())
                     .map(|(q, cent)| q - cent)
                     .collect();
                 let table = codebook.compute_distance_table(&residual_query, metric);
@@ -333,9 +431,10 @@ impl VectorIndex for IvfPqIndex {
             }
 
             // Also scan staging buffer (vectors not yet trained into index).
-            candidates.extend(self.staging.iter().map(|(&id, v)| SearchResult {
+            let dim = self.config.dimensions;
+            candidates.extend(self.staging_ids.iter().enumerate().map(|(i, &id)| SearchResult {
                 id,
-                distance: metric.distance(query, v),
+                distance: metric.distance(query, &self.staging_data[i * dim..(i + 1) * dim]),
             }));
         }
 
@@ -350,7 +449,17 @@ impl VectorIndex for IvfPqIndex {
 
     fn delete(&mut self, id: u64) -> bool {
         // Check staging first.
-        if self.staging.remove(&id).is_some() {
+        if let Some(pos) = self.staging_ids.iter().position(|&sid| sid == id) {
+            let dim = self.config.dimensions;
+            let last = self.staging_ids.len() - 1;
+            if pos != last {
+                self.staging_ids.swap(pos, last);
+                for d in 0..dim {
+                    self.staging_data.swap(pos * dim + d, last * dim + d);
+                }
+            }
+            self.staging_ids.pop();
+            self.staging_data.truncate(last * dim);
             self.originals.remove(&id);
             return true;
         }
@@ -368,7 +477,7 @@ impl VectorIndex for IvfPqIndex {
     }
 
     fn len(&self) -> usize {
-        self.staging.len() + self.posting_lists.iter().map(|l| l.len()).sum::<usize>()
+        self.staging_ids.len() + self.posting_lists.iter().map(|l| l.len()).sum::<usize>()
     }
 
     fn config(&self) -> &IndexConfig {
@@ -376,7 +485,10 @@ impl VectorIndex for IvfPqIndex {
     }
 
     fn iter_vectors(&self) -> Box<dyn Iterator<Item = (u64, Vec<f32>)> + '_> {
-        let staging_iter = self.staging.iter().map(|(&id, v)| (id, v.clone()));
+        let dim = self.config.dimensions;
+        let staging_iter = self.staging_ids.iter().enumerate().map(move |(i, &id)| {
+            (id, self.staging_data[i * dim..(i + 1) * dim].to_vec())
+        });
         let originals_iter = self
             .posting_lists
             .iter()
@@ -386,77 +498,188 @@ impl VectorIndex for IvfPqIndex {
     }
 
     fn flush(&mut self) {
-        if !self.trained && !self.staging.is_empty() {
+        if !self.trained && !self.staging_ids.is_empty() {
             self.train();
         }
     }
 }
 
-// ── K-means (reused from ivf.rs pattern) ─────────────────────────────────────
+// ── K-means (contiguous, with GEMM decomposition + batch4 SIMD) ──────────────
 
-/// Lloyd's algorithm on (id, vector) pairs. Returns `k` centroid vectors.
-fn kmeans_vectors(
-    vectors: &[(u64, Vec<f32>)],
+/// Lloyd's algorithm on contiguous data, returning `(centroids, assignments)`.
+///
+/// `data` is `n * dim` contiguous f32 values (row-major).
+fn kmeans_contiguous(
+    data: &[f32],
+    n: usize,
     k: usize,
+    dim: usize,
     metric: Metric,
     max_iter: usize,
-) -> Vec<Vec<f32>> {
-    let n = vectors.len();
-    let dims = vectors[0].1.len();
+) -> (Vec<f32>, Vec<usize>) {
     let k = k.min(n);
 
     let mut rng = rand::thread_rng();
     let mut indices: Vec<usize> = (0..n).collect();
     indices.shuffle(&mut rng);
-    let mut centroids: Vec<Vec<f32>> = indices[..k].iter().map(|&i| vectors[i].1.clone()).collect();
+
+    let mut centroids = vec![0.0f32; k * dim];
+    for (ci, &src_idx) in indices[..k].iter().enumerate() {
+        centroids[ci * dim..(ci + 1) * dim]
+            .copy_from_slice(&data[src_idx * dim..(src_idx + 1) * dim]);
+    }
 
     let mut assignments = vec![0usize; n];
 
     for _ in 0..max_iter {
         let mut changed = false;
-        for (i, (_, v)) in vectors.iter().enumerate() {
-            let best = nearest_centroid(&centroids, v, metric);
-            if assignments[i] != best {
-                assignments[i] = best;
-                changed = true;
+
+        // Assignment step — GEMM decomposition for L2, batch4 for others
+        if metric == Metric::L2 {
+            batch_assign_l2(data, &centroids, n, k, dim, &mut assignments, &mut changed);
+        } else {
+            for i in 0..n {
+                let vec = &data[i * dim..(i + 1) * dim];
+                let best = nearest_centroid_contiguous(&centroids, k, vec, metric);
+                if assignments[i] != best {
+                    assignments[i] = best;
+                    changed = true;
+                }
             }
         }
+
         if !changed {
             break;
         }
 
-        let mut sums = vec![vec![0.0f32; dims]; k];
+        // Update step: contiguous accumulation
+        let mut sums = vec![0.0f32; k * dim];
         let mut counts = vec![0usize; k];
-        for (i, (_, v)) in vectors.iter().enumerate() {
+        for i in 0..n {
             let c = assignments[i];
-            for (d, &x) in v.iter().enumerate() {
-                sums[c][d] += x;
-            }
             counts[c] += 1;
+            let sums_slice = &mut sums[c * dim..(c + 1) * dim];
+            let vec_slice = &data[i * dim..(i + 1) * dim];
+            for d in 0..dim {
+                sums_slice[d] += vec_slice[d];
+            }
         }
         for c in 0..k {
             if counts[c] > 0 {
                 let cnt = counts[c] as f32;
-                for d in 0..dims {
-                    centroids[c][d] = sums[c][d] / cnt;
+                let base = c * dim;
+                for d in 0..dim {
+                    centroids[base + d] = sums[base + d] / cnt;
                 }
             }
         }
     }
 
-    centroids
+    (centroids, assignments)
 }
 
-/// Return the index of the centroid nearest to `vec`.
+/// Batch L2 assignment using true GEMM (matrix multiply):
+/// `||x_i - c_j||² = ||x_i||² + ||c_j||² - 2·dot(x_i, c_j)`
+///
+/// The cross-term is computed as a single (N×D)×(D×K) matrix multiply via
+/// `matrixmultiply::sgemm`, which uses BLIS-style cache-blocked micro-kernels.
+fn batch_assign_l2(
+    data: &[f32],
+    centroids: &[f32],
+    n: usize,
+    k: usize,
+    dim: usize,
+    assignments: &mut [usize],
+    changed: &mut bool,
+) {
+    let vec_norms: Vec<f32> = (0..n)
+        .map(|i| {
+            let v = &data[i * dim..(i + 1) * dim];
+            distance::dot(v, v)
+        })
+        .collect();
+    let cent_norms: Vec<f32> = (0..k)
+        .map(|j| {
+            let c = &centroids[j * dim..(j + 1) * dim];
+            distance::dot(c, c)
+        })
+        .collect();
+
+    // GEMM: ip = data × centroids^T  (N×K)
+    let mut ip = vec![0.0f32; n * k];
+    unsafe {
+        matrixmultiply::sgemm(
+            n, dim, k,
+            1.0,
+            data.as_ptr(), dim as isize, 1,
+            centroids.as_ptr(), 1, dim as isize,
+            0.0,
+            ip.as_mut_ptr(), k as isize, 1,
+        );
+    }
+
+    for i in 0..n {
+        let xn = vec_norms[i];
+        let row = &ip[i * k..(i + 1) * k];
+        let mut best_dist = f32::MAX;
+        let mut best_idx = 0;
+
+        for j in 0..k {
+            let dist = xn + cent_norms[j] - 2.0 * row[j];
+            if dist < best_dist {
+                best_dist = dist;
+                best_idx = j;
+            }
+        }
+
+        if assignments[i] != best_idx {
+            assignments[i] = best_idx;
+            *changed = true;
+        }
+    }
+}
+
+/// Find nearest centroid from contiguous centroid data using batch4 SIMD.
 #[inline]
-fn nearest_centroid(centroids: &[Vec<f32>], vec: &[f32], metric: Metric) -> usize {
-    centroids
-        .iter()
-        .enumerate()
-        .map(|(i, c)| (i, metric.distance(vec, c)))
-        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(i, _)| i)
-        .unwrap_or(0)
+fn nearest_centroid_contiguous(
+    centroids: &[f32],
+    k: usize,
+    vec: &[f32],
+    metric: Metric,
+) -> usize {
+    let dim = vec.len();
+    let mut best_idx = 0;
+    let mut best_dist = f32::MAX;
+
+    let chunks = k / 4;
+    for chunk in 0..chunks {
+        let base = chunk * 4;
+        let dists = metric.distance_ord_batch4(
+            vec,
+            [
+                &centroids[base * dim..(base + 1) * dim],
+                &centroids[(base + 1) * dim..(base + 2) * dim],
+                &centroids[(base + 2) * dim..(base + 3) * dim],
+                &centroids[(base + 3) * dim..(base + 4) * dim],
+            ],
+        );
+        for (j, &d) in dists.iter().enumerate() {
+            if d < best_dist {
+                best_dist = d;
+                best_idx = base + j;
+            }
+        }
+    }
+
+    for i in (chunks * 4)..k {
+        let d = metric.distance_ord(vec, &centroids[i * dim..(i + 1) * dim]);
+        if d < best_dist {
+            best_dist = d;
+            best_idx = i;
+        }
+    }
+
+    best_idx
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -496,7 +719,7 @@ mod tests {
     fn trains_after_threshold() {
         let idx = make_trained(16);
         assert!(idx.trained, "should be trained after reaching train_size");
-        assert!(!idx.centroids.is_empty());
+        assert!(!idx.centroid_data.is_empty());
         assert!(idx.codebook.is_some());
     }
 
@@ -885,7 +1108,7 @@ mod tests {
         idx.add(0, &[0.0, 0.0, 0.0, 0.0]).unwrap();
         idx.add(1, &[10.0, 0.0, 0.0, 0.0]).unwrap();
         assert!(idx.trained);
-        assert!(idx.centroids.len() <= 2);
+        assert!(idx.nlist <= 2);
     }
 
     #[test]

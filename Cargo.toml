@@ -52,6 +52,9 @@ rayon = "1.10"
 # NOTE: optional = true must live in the crate-level Cargo.toml, not here.
 faiss = "0.13"
 
+# Pure-Rust GEMM (matrix multiply) — BLIS-style micro-kernels with AVX/NEON
+matrixmultiply = "0.3"
+
 [profile.release]
 opt-level = 3
 lto = "fat"

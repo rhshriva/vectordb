@@ -1,0 +1,58 @@
+name: Performance Benchmarks
+
+on:
+  workflow_dispatch:
+
+jobs:
+  benchmark:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x86_64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust build cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Create virtualenv and install dependencies
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install maturin pytest numpy faiss-cpu usearch lancedb
+
+      - name: Build Quiver (release)
+        run: |
+          source .venv/bin/activate
+          maturin develop --release -m crates/quiver-python/Cargo.toml
+
+      - name: Run competitive benchmarks
+        id: bench
+        run: |
+          source .venv/bin/activate
+          echo "## Performance Benchmarks — ${{ matrix.arch }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          pytest tests/test_competitive_benchmarks.py -v -s 2>&1 | tee bench_output.txt
+          # Extract just the table (between the === lines and the PASSED line)
+          sed -n '/^=\{10,\}/,/^PASSED/p' bench_output.txt | head -n -1 >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Runner:** \`${{ matrix.os }}\` (${{ matrix.arch }})" >> $GITHUB_STEP_SUMMARY
+          echo "**CPU cores:** $(nproc)" >> $GITHUB_STEP_SUMMARY
+          echo "**Date:** $(date -u '+%Y-%m-%d %H:%M UTC')" >> $GITHUB_STEP_SUMMARY
