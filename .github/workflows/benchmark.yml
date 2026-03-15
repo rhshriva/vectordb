@@ -2,15 +2,6 @@ name: Performance Benchmarks
 
 on:
   workflow_dispatch:
-    inputs:
-      runner:
-        description: 'Which architectures to benchmark'
-        type: choice
-        options:
-          - both
-          - x86_64-only
-          - arm64-only
-        default: both
 
 jobs:
   benchmark:
@@ -23,12 +14,6 @@ jobs:
           - os: ubuntu-24.04-arm
             arch: arm64
     runs-on: ${{ matrix.os }}
-    # Skip based on input selection (default to 'both' when not specified)
-    if: >-
-      github.event.inputs.runner == 'both' ||
-      github.event.inputs.runner == '' ||
-      (github.event.inputs.runner == 'x86_64-only' && matrix.arch == 'x86_64') ||
-      (github.event.inputs.runner == 'arm64-only' && matrix.arch == 'arm64')
 
     steps:
       - name: Checkout
