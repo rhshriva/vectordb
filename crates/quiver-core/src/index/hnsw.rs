@@ -1904,4 +1904,606 @@ mod tests {
         assert!(found as f64 / n as f64 > 0.90,
             "self-recall too low: {}/{}", found, n);
     }
+
+    // ── iter_vectors tests ──────────────────────────────────────────────
+
+    #[test]
+    fn iter_vectors_returns_all_alive() {
+        let idx = make_index();
+        let all: Vec<(u64, Vec<f32>)> = idx.iter_vectors().collect();
+        assert_eq!(all.len(), 20);
+        // Each vector should match what was inserted
+        for (id, vec) in &all {
+            assert_eq!(vec.len(), 3);
+            assert!((vec[0] - *id as f32).abs() < 1e-6);
+            assert!((vec[1]).abs() < 1e-6);
+            assert!((vec[2]).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn iter_vectors_excludes_deleted() {
+        let mut idx = make_index();
+        idx.delete(3);
+        idx.delete(7);
+        idx.delete(15);
+        let all: Vec<(u64, Vec<f32>)> = idx.iter_vectors().collect();
+        assert_eq!(all.len(), 17);
+        let ids: Vec<u64> = all.iter().map(|(id, _)| *id).collect();
+        assert!(!ids.contains(&3));
+        assert!(!ids.contains(&7));
+        assert!(!ids.contains(&15));
+    }
+
+    #[test]
+    fn iter_vectors_empty_index() {
+        let idx = HnswIndex::new(3, Metric::L2, HnswConfig::default());
+        let all: Vec<(u64, Vec<f32>)> = idx.iter_vectors().collect();
+        assert!(all.is_empty());
+    }
+
+    // ── set_ef_search tests ─────────────────────────────────────────────
+
+    #[test]
+    fn set_ef_search_changes_parameter() {
+        let mut idx = make_index();
+        assert_eq!(idx.hnsw_config.ef_search, 20);
+        idx.set_ef_search(100);
+        assert_eq!(idx.hnsw_config.ef_search, 100);
+        // Search should still work after changing ef_search
+        let r = idx.search(&[5.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(r[0].id, 5);
+    }
+
+    #[test]
+    fn set_ef_search_to_1() {
+        let mut idx = make_index();
+        idx.set_ef_search(1);
+        // With ef=1, search is greedy — may not find exact best but should return something
+        let r = idx.search(&[5.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(r.len(), 1);
+    }
+
+    #[test]
+    fn set_ef_search_high_improves_results() {
+        // Build a larger index where ef_search matters
+        let dim = 16;
+        let n = 200;
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 1, m: 8 };
+        let mut idx = HnswIndex::new(dim, Metric::L2, cfg);
+        let mut rng = rand::thread_rng();
+        let mut data = vec![0.0f32; n * dim];
+        for v in data.iter_mut() {
+            *v = rng.gen::<f32>() * 100.0;
+        }
+        for i in 0..n {
+            idx.add(i as u64, &data[i * dim..(i + 1) * dim]).unwrap();
+        }
+
+        // Count self-recall with ef=1
+        let mut found_low = 0;
+        for i in 0..n {
+            let q = &data[i * dim..(i + 1) * dim];
+            let r = idx.search(q, 1).unwrap();
+            if !r.is_empty() && r[0].id == i as u64 { found_low += 1; }
+        }
+
+        // Now increase ef_search and re-test
+        idx.set_ef_search(200);
+        let mut found_high = 0;
+        for i in 0..n {
+            let q = &data[i * dim..(i + 1) * dim];
+            let r = idx.search(q, 1).unwrap();
+            if !r.is_empty() && r[0].id == i as u64 { found_high += 1; }
+        }
+        assert!(found_high >= found_low,
+            "higher ef_search should not degrade recall: low={found_low} high={found_high}");
+    }
+
+    // ── VisitedTracker tests (via public API) ───────────────────────────
+
+    #[test]
+    fn visited_tracker_generation_overflow() {
+        // Test that VisitedTracker handles generation overflow gracefully
+        let mut vt = VisitedTracker::new();
+        vt.ensure_capacity(10);
+        // Set generation close to overflow
+        vt.gen = u32::MAX;
+        vt.visit(0);
+        assert_eq!(vt.marks[0], u32::MAX);
+
+        // This reset should trigger overflow handling: clears marks, sets gen=1
+        vt.reset();
+        assert_eq!(vt.gen, 1);
+        // After overflow reset, all marks should be cleared
+        for &m in vt.marks.iter() {
+            assert_eq!(m, 0);
+        }
+        // visit should work after overflow
+        assert!(vt.visit(0)); // newly visited
+        assert!(!vt.visit(0)); // already visited
+    }
+
+    #[test]
+    fn visited_tracker_ensure_capacity() {
+        let mut vt = VisitedTracker::new();
+        assert_eq!(vt.marks.len(), 0);
+        vt.ensure_capacity(100);
+        assert!(vt.marks.len() >= 100);
+        // Calling with smaller value is a no-op
+        vt.ensure_capacity(50);
+        assert!(vt.marks.len() >= 100);
+        // Calling with larger value grows
+        vt.ensure_capacity(200);
+        assert!(vt.marks.len() >= 200);
+    }
+
+    #[test]
+    fn visited_tracker_reset_increments_generation() {
+        let mut vt = VisitedTracker::new();
+        vt.ensure_capacity(5);
+        assert_eq!(vt.gen, 1);
+        assert!(vt.visit(0));
+        assert!(!vt.visit(0));
+        vt.reset();
+        assert_eq!(vt.gen, 2);
+        // After reset, same node should be "newly visited"
+        assert!(vt.visit(0));
+    }
+
+    // ── Delete entry point tests ────────────────────────────────────────
+
+    #[test]
+    fn delete_entry_point_selects_new_one() {
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 20, m: 8 };
+        let mut idx = HnswIndex::new(3, Metric::L2, cfg);
+        // Insert just a few vectors
+        for i in 0..5u64 {
+            idx.add(i, &[i as f32, 0.0, 0.0]).unwrap();
+        }
+        // The entry point is one of 0..5
+        let ep = idx.graph.entry_point.unwrap();
+        // Delete the entry point
+        assert!(idx.delete(ep as u64));
+        // A new entry point should be selected
+        assert!(idx.graph.entry_point.is_some());
+        assert_ne!(idx.graph.entry_point.unwrap(), ep);
+        // Search should still work
+        let r = idx.search(&[2.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(r.len(), 1);
+    }
+
+    #[test]
+    fn delete_all_clears_entry_point() {
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 20, m: 8 };
+        let mut idx = HnswIndex::new(2, Metric::L2, cfg);
+        idx.add(0, &[1.0, 0.0]).unwrap();
+        idx.add(1, &[0.0, 1.0]).unwrap();
+        idx.delete(0);
+        idx.delete(1);
+        assert_eq!(idx.len(), 0);
+        assert!(idx.graph.entry_point.is_none());
+        // Search on empty index should return empty
+        let r = idx.search(&[1.0, 0.0], 1).unwrap();
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn delete_non_existent_returns_false() {
+        let mut idx = make_index();
+        assert!(!idx.delete(999));
+        assert_eq!(idx.len(), 20);
+    }
+
+    #[test]
+    fn delete_twice_returns_false_second_time() {
+        let mut idx = make_index();
+        assert!(idx.delete(5));
+        assert!(!idx.delete(5));
+        assert_eq!(idx.len(), 19);
+    }
+
+    // ── Search edge cases ───────────────────────────────────────────────
+
+    #[test]
+    fn search_ef_1_returns_result() {
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 1, m: 8 };
+        let mut idx = HnswIndex::new(3, Metric::L2, cfg);
+        for i in 0..10u64 {
+            idx.add(i, &[i as f32, 0.0, 0.0]).unwrap();
+        }
+        let r = idx.search(&[5.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(r.len(), 1);
+    }
+
+    #[test]
+    fn search_k_greater_than_len() {
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 20, m: 8 };
+        let mut idx = HnswIndex::new(2, Metric::L2, cfg);
+        idx.add(0, &[1.0, 0.0]).unwrap();
+        idx.add(1, &[0.0, 1.0]).unwrap();
+        idx.add(2, &[1.0, 1.0]).unwrap();
+        // k=10 but only 3 vectors in index
+        let r = idx.search(&[0.5, 0.5], 10).unwrap();
+        assert_eq!(r.len(), 3);
+    }
+
+    #[test]
+    fn search_single_vector_index() {
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 20, m: 8 };
+        let mut idx = HnswIndex::new(3, Metric::L2, cfg);
+        idx.add(42, &[1.0, 2.0, 3.0]).unwrap();
+        let r = idx.search(&[1.0, 2.0, 3.0], 5).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].id, 42);
+        assert!(r[0].distance < 1e-6);
+    }
+
+    #[test]
+    fn search_after_all_deleted_returns_empty() {
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 20, m: 8 };
+        let mut idx = HnswIndex::new(2, Metric::L2, cfg);
+        idx.add(0, &[1.0, 0.0]).unwrap();
+        idx.add(1, &[0.0, 1.0]).unwrap();
+        idx.delete(0);
+        idx.delete(1);
+        let r = idx.search(&[0.5, 0.5], 1).unwrap();
+        assert!(r.is_empty());
+    }
+
+    // ── Parallel insert edge cases ──────────────────────────────────────
+
+    #[test]
+    fn parallel_insert_empty_batch() {
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 20, m: 8 };
+        let mut idx = HnswIndex::new(4, Metric::L2, cfg);
+        let data: Vec<f32> = vec![];
+        idx.add_batch_parallel(&data, 4, 0, 4, 64).unwrap();
+        assert_eq!(idx.len(), 0);
+    }
+
+    #[test]
+    fn parallel_insert_bootstrap_larger_than_n() {
+        // micro_batch_size > n means all vectors go through bootstrap (sequential)
+        let dim = 4;
+        let n = 10;
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 20, m: 8 };
+        let mut idx = HnswIndex::new(dim, Metric::L2, cfg);
+        let mut data = vec![0.0f32; n * dim];
+        let mut rng = rand::thread_rng();
+        for v in data.iter_mut() {
+            *v = rng.gen::<f32>();
+        }
+        // micro_batch_size = 1000 >> n = 10
+        idx.add_batch_parallel(&data, dim, 0, 2, 1000).unwrap();
+        assert_eq!(idx.len(), n);
+        // Should still find vectors
+        let r = idx.search(&data[0..dim], 1).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].id, 0);
+    }
+
+    #[test]
+    fn parallel_insert_dimension_mismatch() {
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 20, m: 8 };
+        let mut idx = HnswIndex::new(4, Metric::L2, cfg);
+        let data = vec![1.0f32; 15]; // 15 is not divisible by 4... actually it is not
+        // Wrong dimension
+        let result = idx.add_batch_parallel(&data, 3, 0, 2, 64);
+        assert!(result.is_err());
+    }
+
+    // ── Snapshot edge cases ─────────────────────────────────────────────
+
+    #[test]
+    fn snapshot_empty_graph_round_trip() {
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 20, m: 8 };
+        let idx = HnswIndex::new(4, Metric::L2, cfg);
+        let path = "/tmp/hnsw_empty_snapshot_test.bin";
+        // save_graph returns Ok(()) for empty graph (no-op)
+        idx.save_graph(std::path::Path::new(path)).unwrap();
+        // save (full index) should work for empty
+        idx.save(path).unwrap();
+        let loaded = HnswIndex::load(path).unwrap();
+        assert_eq!(loaded.len(), 0);
+        let r = loaded.search(&[1.0, 2.0, 3.0, 4.0], 1).unwrap();
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn snapshot_sparse_ids_round_trip() {
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 20, m: 8 };
+        let mut idx = HnswIndex::new(2, Metric::L2, cfg);
+        // Use sparse IDs: 0, 10, 100, 500
+        idx.add(0, &[0.0, 0.0]).unwrap();
+        idx.add(10, &[1.0, 0.0]).unwrap();
+        idx.add(100, &[2.0, 0.0]).unwrap();
+        idx.add(500, &[3.0, 0.0]).unwrap();
+        let path = "/tmp/hnsw_sparse_ids_test.bin";
+        idx.save(path).unwrap();
+        let loaded = HnswIndex::load(path).unwrap();
+        assert_eq!(loaded.len(), 4);
+        // Verify each vector is retrievable
+        let r = loaded.search(&[0.0, 0.0], 1).unwrap();
+        assert_eq!(r[0].id, 0);
+        let r = loaded.search(&[3.0, 0.0], 1).unwrap();
+        assert_eq!(r[0].id, 500);
+    }
+
+    #[test]
+    fn snapshot_after_deletes_round_trip() {
+        let mut idx = make_index();
+        idx.delete(5);
+        idx.delete(10);
+        idx.delete(15);
+        let path = "/tmp/hnsw_deleted_snapshot_test.bin";
+        idx.save(path).unwrap();
+        let loaded = HnswIndex::load(path).unwrap();
+        assert_eq!(loaded.len(), 17);
+        // Deleted IDs should not be found
+        let all: Vec<(u64, Vec<f32>)> = loaded.iter_vectors().collect();
+        let ids: Vec<u64> = all.iter().map(|(id, _)| *id).collect();
+        assert!(!ids.contains(&5));
+        assert!(!ids.contains(&10));
+        assert!(!ids.contains(&15));
+    }
+
+    // ── Multi-metric tests ──────────────────────────────────────────────
+
+    #[test]
+    fn l2_metric_insert_and_search() {
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 50, m: 8 };
+        let mut idx = HnswIndex::new(3, Metric::L2, cfg);
+        idx.add(0, &[0.0, 0.0, 0.0]).unwrap();
+        idx.add(1, &[1.0, 0.0, 0.0]).unwrap();
+        idx.add(2, &[10.0, 0.0, 0.0]).unwrap();
+        let r = idx.search(&[0.5, 0.0, 0.0], 1).unwrap();
+        // Closest to [0.5, 0, 0] under L2 should be id=0 or id=1
+        assert!(r[0].id == 0 || r[0].id == 1);
+    }
+
+    #[test]
+    fn cosine_metric_direction_matters() {
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 50, m: 8 };
+        let mut idx = HnswIndex::new(2, Metric::Cosine, cfg);
+        idx.add(0, &[1.0, 0.0]).unwrap();
+        idx.add(1, &[0.0, 1.0]).unwrap();
+        idx.add(2, &[0.707, 0.707]).unwrap();
+        // Query in x-direction; closest cosine should be id=0
+        let r = idx.search(&[10.0, 0.0], 1).unwrap();
+        assert_eq!(r[0].id, 0);
+        // Query in y-direction; closest cosine should be id=1
+        let r = idx.search(&[0.0, 10.0], 1).unwrap();
+        assert_eq!(r[0].id, 1);
+    }
+
+    #[test]
+    fn dot_product_favors_largest_projection() {
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 50, m: 8 };
+        let mut idx = HnswIndex::new(2, Metric::DotProduct, cfg);
+        idx.add(0, &[1.0, 0.0]).unwrap();
+        idx.add(1, &[5.0, 0.0]).unwrap();
+        idx.add(2, &[10.0, 0.0]).unwrap();
+        // DotProduct: query [1,0] should favor largest x component (id=2)
+        let r = idx.search(&[1.0, 0.0], 1).unwrap();
+        assert_eq!(r[0].id, 2);
+    }
+
+    #[test]
+    fn all_metrics_search_returns_results() {
+        for metric in &[Metric::L2, Metric::Cosine, Metric::DotProduct] {
+            let cfg = HnswConfig { ef_construction: 100, ef_search: 20, m: 8 };
+            let mut idx = HnswIndex::new(4, *metric, cfg);
+            for i in 1..=10u64 {
+                idx.add(i, &[i as f32, 0.0, 0.0, 0.0]).unwrap();
+            }
+            let r = idx.search(&[5.0, 0.0, 0.0, 0.0], 3).unwrap();
+            assert_eq!(r.len(), 3, "metric {:?} should return 3 results", metric);
+        }
+    }
+
+    // ── Layer-0 buffer helpers ──────────────────────────────────────────
+
+    #[test]
+    fn layer0_set_and_get_neighbors() {
+        let mut graph = HnswGraph::new(2, 4, 100); // m=4, m_max0=8
+        graph.ensure_capacity(5);
+        graph.alive[0] = true;
+        // Set neighbors for node 0
+        graph.set_layer0_neighbors(0, &[1, 2, 3]);
+        let nbs = graph.get_neighbors(0, 0);
+        assert_eq!(nbs, &[1, 2, 3]);
+    }
+
+    #[test]
+    fn layer0_push_neighbor() {
+        let mut graph = HnswGraph::new(2, 4, 100);
+        graph.ensure_capacity(5);
+        graph.alive[0] = true;
+        graph.set_layer0_neighbors(0, &[1, 2]);
+        let new_count = graph.push_layer0_neighbor(0, 3);
+        assert_eq!(new_count, 3);
+        let nbs = graph.get_neighbors(0, 0);
+        assert_eq!(nbs, &[1, 2, 3]);
+    }
+
+    #[test]
+    fn layer0_swap_remove() {
+        let mut graph = HnswGraph::new(2, 4, 100);
+        graph.ensure_capacity(5);
+        graph.alive[0] = true;
+        graph.set_layer0_neighbors(0, &[10, 20, 30, 40]);
+        // Remove index 1 (value 20), should swap in last element (40)
+        graph.swap_remove_layer0(0, 1);
+        let nbs = graph.get_neighbors(0, 0);
+        assert_eq!(nbs.len(), 3);
+        assert_eq!(nbs[0], 10);
+        assert_eq!(nbs[1], 40); // swapped from end
+        assert_eq!(nbs[2], 30);
+    }
+
+    #[test]
+    fn layer0_swap_remove_last() {
+        let mut graph = HnswGraph::new(2, 4, 100);
+        graph.ensure_capacity(5);
+        graph.alive[0] = true;
+        graph.set_layer0_neighbors(0, &[10, 20, 30]);
+        // Remove last element
+        graph.swap_remove_layer0(0, 2);
+        let nbs = graph.get_neighbors(0, 0);
+        assert_eq!(nbs, &[10, 20]);
+    }
+
+    #[test]
+    fn layer0_overwrite_neighbors() {
+        let mut graph = HnswGraph::new(2, 4, 100);
+        graph.ensure_capacity(5);
+        graph.alive[0] = true;
+        graph.set_layer0_neighbors(0, &[1, 2, 3, 4, 5]);
+        assert_eq!(graph.get_neighbors(0, 0).len(), 5);
+        // Overwrite with fewer neighbors
+        graph.set_layer0_neighbors(0, &[10, 20]);
+        assert_eq!(graph.get_neighbors(0, 0), &[10, 20]);
+    }
+
+    // ── Duplicate ID error ──────────────────────────────────────────────
+
+    #[test]
+    fn add_duplicate_id_returns_error() {
+        let mut idx = make_index();
+        let result = idx.add(5, &[99.0, 99.0, 99.0]);
+        assert!(result.is_err());
+        assert_eq!(idx.len(), 20); // no change
+    }
+
+    // ── add_batch_raw tests ─────────────────────────────────────────────
+
+    #[test]
+    fn add_batch_raw_dimension_mismatch() {
+        let cfg = HnswConfig::default();
+        let mut idx = HnswIndex::new(3, Metric::L2, cfg);
+        let data = vec![1.0f32; 8]; // 8 / 4 = 2 vectors of dim 4, but index is dim 3
+        let result = idx.add_batch_raw(&data, 4, 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn add_batch_raw_not_divisible() {
+        let cfg = HnswConfig::default();
+        let mut idx = HnswIndex::new(3, Metric::L2, cfg);
+        let data = vec![1.0f32; 7]; // 7 not divisible by 3
+        let result = idx.add_batch_raw(&data, 3, 0);
+        assert!(result.is_err());
+    }
+
+    // ── HnswGraph snapshot from_snapshot empty ──────────────────────────
+
+    #[test]
+    fn graph_from_snapshot_empty() {
+        let snap = HnswGraphSnapshot {
+            nodes: HashMap::new(),
+            entry_point: None,
+            m: 8,
+            m_max0: 16,
+            ef_construction: 100,
+            ml: 1.0 / (8.0f64).ln(),
+        };
+        let graph = HnswGraph::from_snapshot(snap, 4);
+        assert_eq!(graph.count, 0);
+        assert!(graph.entry_point.is_none());
+        assert_eq!(graph.dim, 4);
+        assert_eq!(graph.m, 8);
+    }
+
+    // ── with_flush_threshold (no-op) ────────────────────────────────────
+
+    #[test]
+    fn with_flush_threshold_is_noop() {
+        let cfg = HnswConfig::default();
+        let idx = HnswIndex::new(3, Metric::L2, cfg).with_flush_threshold(42);
+        assert_eq!(idx.config().dimensions, 3);
+    }
+
+    // ── config accessor ─────────────────────────────────────────────────
+
+    #[test]
+    fn config_returns_correct_values() {
+        let cfg = HnswConfig { ef_construction: 50, ef_search: 10, m: 4 };
+        let idx = HnswIndex::new(8, Metric::Cosine, cfg);
+        assert_eq!(idx.config().dimensions, 8);
+        assert_eq!(idx.config().metric, Metric::Cosine);
+    }
+
+    // ── Graph internal consistency ──────────────────────────────────────
+
+    #[test]
+    fn graph_count_matches_alive() {
+        let mut idx = make_index();
+        assert_eq!(idx.graph.count, 20);
+        idx.delete(0);
+        idx.delete(19);
+        assert_eq!(idx.graph.count, 18);
+        let alive_count = idx.graph.alive.iter().filter(|&&a| a).count();
+        assert_eq!(alive_count, 18);
+    }
+
+    #[test]
+    fn graph_max_neighbors_layer0_vs_upper() {
+        let graph = HnswGraph::new(4, 8, 100); // m=8
+        assert_eq!(graph.max_neighbors(0), 16); // m_max0 = 2*m = 16
+        assert_eq!(graph.max_neighbors(1), 8);  // upper layers = m
+        assert_eq!(graph.max_neighbors(5), 8);
+    }
+
+    // ── Batch add error on duplicate ────────────────────────────────────
+
+    #[test]
+    fn add_batch_duplicate_id_error() {
+        let mut idx = make_index();
+        let entries: Vec<(u64, Vec<f32>)> = vec![
+            (5, vec![99.0, 99.0, 99.0]), // id=5 already exists
+        ];
+        let result = idx.add_batch(&entries);
+        assert!(result.is_err());
+    }
+
+    // ── Large batch with delete and re-search ───────────────────────────
+
+    #[test]
+    fn bulk_insert_delete_half_search_remaining() {
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 50, m: 8 };
+        let mut idx = HnswIndex::new(2, Metric::L2, cfg);
+        let n = 100u64;
+        for i in 0..n {
+            idx.add(i, &[i as f32, 0.0]).unwrap();
+        }
+        assert_eq!(idx.len(), 100);
+        // Delete even IDs
+        for i in (0..n).step_by(2) {
+            idx.delete(i);
+        }
+        assert_eq!(idx.len(), 50);
+        // iter_vectors should only show odd IDs
+        let remaining: Vec<u64> = idx.iter_vectors().map(|(id, _)| id).collect();
+        assert_eq!(remaining.len(), 50);
+        for id in &remaining {
+            assert!(id % 2 == 1, "iter_vectors should only yield odd IDs, got {}", id);
+        }
+        // Search should return results from remaining vectors
+        let r = idx.search(&[1.0, 0.0], 3).unwrap();
+        assert!(!r.is_empty(), "search should return results after partial delete");
+    }
+
+    // ── Stress: many searches without reset issues ──────────────────────
+
+    #[test]
+    fn many_searches_no_tracker_issue() {
+        let idx = make_index();
+        // Run many searches to stress VisitedTracker reset
+        for i in 0..500 {
+            let q = vec![(i % 20) as f32, 0.0, 0.0];
+            let r = idx.search(&q, 3).unwrap();
+            assert!(!r.is_empty());
+        }
+    }
 }

@@ -1215,4 +1215,668 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].id, 1); // closest dense
     }
+
+    // ── Snapshot tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn snapshot_create_and_list() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("snap_test", IndexType::Flat);
+        let mut col = Collection::create(&path, meta).unwrap();
+
+        col.upsert(1, vec![1.0, 0.0, 0.0], Some(serde_json::json!({"k": "v"}))).unwrap();
+        col.upsert(2, vec![0.0, 1.0, 0.0], None).unwrap();
+
+        let snap = col.create_snapshot("v1").unwrap();
+        assert_eq!(snap.name, "v1");
+        assert_eq!(snap.vector_count, 2);
+
+        let snaps = col.list_snapshots().unwrap();
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].name, "v1");
+    }
+
+    #[test]
+    fn snapshot_list_empty() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("snap_test", IndexType::Flat);
+        let col = Collection::create(&path, meta).unwrap();
+        let snaps = col.list_snapshots().unwrap();
+        assert!(snaps.is_empty());
+    }
+
+    #[test]
+    fn snapshot_restore() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("snap_test", IndexType::Flat);
+        let mut col = Collection::create(&path, meta).unwrap();
+
+        col.upsert(1, vec![1.0, 0.0, 0.0], None).unwrap();
+        col.upsert(2, vec![0.0, 1.0, 0.0], None).unwrap();
+        col.create_snapshot("v1").unwrap();
+
+        // Mutate after snapshot
+        col.upsert(3, vec![0.0, 0.0, 1.0], None).unwrap();
+        col.delete(1).unwrap();
+        assert_eq!(col.count(), 2); // ids 2, 3
+
+        // Restore
+        col.restore_snapshot("v1").unwrap();
+        assert_eq!(col.count(), 2); // ids 1, 2 again
+        let results = col.search(&[1.0, 0.0, 0.0], 1, None).unwrap();
+        assert_eq!(results[0].id, 1);
+    }
+
+    #[test]
+    fn snapshot_delete() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("snap_test", IndexType::Flat);
+        let mut col = Collection::create(&path, meta).unwrap();
+
+        col.upsert(1, vec![1.0, 0.0, 0.0], None).unwrap();
+        col.create_snapshot("v1").unwrap();
+
+        col.delete_snapshot("v1").unwrap();
+        let snaps = col.list_snapshots().unwrap();
+        assert!(snaps.is_empty());
+    }
+
+    #[test]
+    fn snapshot_duplicate_name_errors() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("snap_test", IndexType::Flat);
+        let mut col = Collection::create(&path, meta).unwrap();
+        col.upsert(1, vec![1.0, 0.0, 0.0], None).unwrap();
+
+        col.create_snapshot("dup").unwrap();
+        let err = col.create_snapshot("dup").unwrap_err();
+        assert!(matches!(err, VectorDbError::SnapshotAlreadyExists(_)));
+    }
+
+    #[test]
+    fn snapshot_invalid_name_errors() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("snap_test", IndexType::Flat);
+        let col = Collection::create(&path, meta).unwrap();
+
+        // Empty name
+        assert!(col.create_snapshot("").is_err());
+        // Path traversal
+        assert!(col.create_snapshot("..").is_err());
+        assert!(col.create_snapshot("a/../b").is_err());
+        // Slash
+        assert!(col.create_snapshot("a/b").is_err());
+        // Backslash
+        assert!(col.create_snapshot("a\\b").is_err());
+    }
+
+    #[test]
+    fn snapshot_restore_nonexistent_errors() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("snap_test", IndexType::Flat);
+        let mut col = Collection::create(&path, meta).unwrap();
+
+        let err = col.restore_snapshot("nope").unwrap_err();
+        assert!(matches!(err, VectorDbError::SnapshotNotFound(_)));
+    }
+
+    #[test]
+    fn snapshot_delete_nonexistent_errors() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("snap_test", IndexType::Flat);
+        let col = Collection::create(&path, meta).unwrap();
+
+        let err = col.delete_snapshot("nope").unwrap_err();
+        assert!(matches!(err, VectorDbError::SnapshotNotFound(_)));
+    }
+
+    #[test]
+    fn snapshot_multiple_listed() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("snap_test", IndexType::Flat);
+        let mut col = Collection::create(&path, meta).unwrap();
+        col.upsert(1, vec![1.0, 0.0, 0.0], None).unwrap();
+
+        col.create_snapshot("alpha").unwrap();
+        col.create_snapshot("beta").unwrap();
+
+        let snaps = col.list_snapshots().unwrap();
+        assert_eq!(snaps.len(), 2);
+        let names: Vec<&str> = snaps.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"alpha"));
+        assert!(names.contains(&"beta"));
+    }
+
+    // ── Batch upsert tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn upsert_batch_basic() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("batch", IndexType::Flat);
+        let mut col = Collection::create(&path, meta).unwrap();
+
+        let entries = vec![
+            (1, vec![1.0, 0.0, 0.0], None),
+            (2, vec![0.0, 1.0, 0.0], None),
+            (3, vec![0.0, 0.0, 1.0], None),
+        ];
+        col.upsert_batch(entries).unwrap();
+        assert_eq!(col.count(), 3);
+
+        let results = col.search(&[1.0, 0.0, 0.0], 1, None).unwrap();
+        assert_eq!(results[0].id, 1);
+    }
+
+    #[test]
+    fn upsert_batch_with_payloads() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("batch", IndexType::Flat);
+        let mut col = Collection::create(&path, meta).unwrap();
+
+        let entries = vec![
+            (1, vec![1.0, 0.0, 0.0], Some(serde_json::json!({"a": 1}))),
+            (2, vec![0.0, 1.0, 0.0], Some(serde_json::json!({"a": 2}))),
+        ];
+        col.upsert_batch(entries).unwrap();
+
+        let results = col.search(&[1.0, 0.0, 0.0], 2, None).unwrap();
+        let r1 = results.iter().find(|r| r.id == 1).unwrap();
+        assert_eq!(r1.payload.as_ref().unwrap()["a"], 1);
+    }
+
+    #[test]
+    fn upsert_batch_empty() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("batch", IndexType::Flat);
+        let mut col = Collection::create(&path, meta).unwrap();
+
+        col.upsert_batch(vec![]).unwrap();
+        assert_eq!(col.count(), 0);
+    }
+
+    #[test]
+    fn upsert_batch_duplicate_ids_last_wins() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("batch", IndexType::Flat);
+        let mut col = Collection::create(&path, meta).unwrap();
+
+        let entries = vec![
+            (1, vec![1.0, 0.0, 0.0], Some(serde_json::json!({"v": "first"}))),
+            (1, vec![0.0, 1.0, 0.0], Some(serde_json::json!({"v": "second"}))),
+        ];
+        col.upsert_batch(entries).unwrap();
+        assert_eq!(col.count(), 1);
+
+        let results = col.search(&[0.0, 1.0, 0.0], 1, None).unwrap();
+        assert_eq!(results[0].id, 1);
+        assert_eq!(results[0].payload.as_ref().unwrap()["v"], "second");
+    }
+
+    #[test]
+    fn upsert_batch_persists_across_restart() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("batch", IndexType::Flat);
+
+        {
+            let mut col = Collection::create(&path, meta).unwrap();
+            let entries = vec![
+                (1, vec![1.0, 0.0, 0.0], None),
+                (2, vec![0.0, 1.0, 0.0], None),
+            ];
+            col.upsert_batch(entries).unwrap();
+        }
+
+        let col = Collection::load(&path).unwrap();
+        assert_eq!(col.count(), 2);
+    }
+
+    // ── Embedder tests ────────────────────────────────────────────────────────
+
+    struct MockEmbedder {
+        dims: usize,
+    }
+
+    impl crate::embedder::TextEmbedder for MockEmbedder {
+        fn embed(&self, text: &str) -> Result<Vec<f32>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(vec![text.len() as f32 / 10.0; self.dims])
+        }
+        fn dimensions(&self) -> Option<usize> {
+            Some(self.dims)
+        }
+    }
+
+    struct FailingEmbedder;
+
+    impl crate::embedder::TextEmbedder for FailingEmbedder {
+        fn embed(&self, _text: &str) -> Result<Vec<f32>, Box<dyn std::error::Error + Send + Sync>> {
+            Err("model unavailable".into())
+        }
+        fn dimensions(&self) -> Option<usize> {
+            None
+        }
+    }
+
+    #[test]
+    fn set_embedder_dimension_mismatch() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("emb", IndexType::Flat); // dims=3
+        let mut col = Collection::create(&path, meta).unwrap();
+
+        let embedder = Arc::new(MockEmbedder { dims: 128 }); // mismatched
+        let err = col.set_embedder(embedder).unwrap_err();
+        assert!(matches!(err, VectorDbError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn set_embedder_matching_dims_succeeds() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("emb", IndexType::Flat); // dims=3
+        let mut col = Collection::create(&path, meta).unwrap();
+
+        let embedder = Arc::new(MockEmbedder { dims: 3 });
+        col.set_embedder(embedder).unwrap();
+    }
+
+    #[test]
+    fn upsert_text_without_embedder_errors() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("emb", IndexType::Flat);
+        let mut col = Collection::create(&path, meta).unwrap();
+
+        let err = col.upsert_text(1, "hello", None).unwrap_err();
+        assert!(matches!(err, VectorDbError::NoEmbedder(_)));
+    }
+
+    #[test]
+    fn search_text_without_embedder_errors() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("emb", IndexType::Flat);
+        let mut col = Collection::create(&path, meta).unwrap();
+        col.upsert(1, vec![1.0, 0.0, 0.0], None).unwrap();
+
+        let err = col.search_text("hello", 5).unwrap_err();
+        assert!(matches!(err, VectorDbError::NoEmbedder(_)));
+    }
+
+    #[test]
+    fn upsert_text_and_search_text_with_embedder() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("emb", IndexType::Flat); // dims=3
+        let mut col = Collection::create(&path, meta).unwrap();
+
+        let embedder = Arc::new(MockEmbedder { dims: 3 });
+        col.set_embedder(embedder).unwrap();
+
+        col.upsert_text(1, "hi", Some(serde_json::json!({"text": "hi"}))).unwrap();
+        col.upsert_text(2, "hello world", None).unwrap();
+        assert_eq!(col.count(), 2);
+
+        // Search for text similar to "hi" (len=2 → [0.2, 0.2, 0.2])
+        let results = col.search_text("hi", 2).unwrap();
+        assert!(!results.is_empty());
+        // "hi" (len=2) should be closest to query "hi" (len=2)
+        assert_eq!(results[0].id, 1);
+    }
+
+    #[test]
+    fn embedding_error_propagates() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("emb", IndexType::Flat);
+        let mut col = Collection::create(&path, meta).unwrap();
+
+        let embedder = Arc::new(FailingEmbedder);
+        col.set_embedder(embedder).unwrap(); // unknown dims, so no mismatch check
+
+        let err = col.upsert_text(1, "test", None).unwrap_err();
+        assert!(matches!(err, VectorDbError::EmbeddingError(_)));
+    }
+
+    // ── Search edge cases ─────────────────────────────────────────────────────
+
+    #[test]
+    fn search_k_zero_returns_empty() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("test", IndexType::Flat);
+        let mut col = Collection::create(&path, meta).unwrap();
+        col.upsert(1, vec![1.0, 0.0, 0.0], None).unwrap();
+
+        let results = col.search(&[1.0, 0.0, 0.0], 0, None).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_filter_matches_nothing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("test", IndexType::Flat);
+        let mut col = Collection::create(&path, meta).unwrap();
+
+        col.upsert(1, vec![1.0, 0.0, 0.0], Some(serde_json::json!({"tag": "a"}))).unwrap();
+        col.upsert(2, vec![0.0, 1.0, 0.0], Some(serde_json::json!({"tag": "a"}))).unwrap();
+
+        let filter: FilterCondition = serde_json::from_str(r#"{"tag": {"$eq": "nonexistent"}}"#).unwrap();
+        let results = col.search(&[1.0, 0.0, 0.0], 5, Some(&filter)).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_filter_returns_fewer_than_k() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("test", IndexType::Flat);
+        let mut col = Collection::create(&path, meta).unwrap();
+
+        col.upsert(1, vec![1.0, 0.0, 0.0], Some(serde_json::json!({"tag": "a"}))).unwrap();
+        col.upsert(2, vec![0.0, 1.0, 0.0], Some(serde_json::json!({"tag": "b"}))).unwrap();
+        col.upsert(3, vec![0.0, 0.0, 1.0], Some(serde_json::json!({"tag": "b"}))).unwrap();
+
+        let filter: FilterCondition = serde_json::from_str(r#"{"tag": {"$eq": "a"}}"#).unwrap();
+        let results = col.search(&[1.0, 0.0, 0.0], 10, Some(&filter)).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, 1);
+    }
+
+    #[test]
+    fn search_empty_collection() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("test", IndexType::Flat);
+        let col = Collection::create(&path, meta).unwrap();
+
+        let results = col.search(&[1.0, 0.0, 0.0], 5, None).unwrap();
+        assert!(results.is_empty());
+    }
+
+    // ── Delete behavior ───────────────────────────────────────────────────────
+
+    #[test]
+    fn delete_returns_true_when_found() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("test", IndexType::Flat);
+        let mut col = Collection::create(&path, meta).unwrap();
+
+        col.upsert(1, vec![1.0, 0.0, 0.0], None).unwrap();
+        let found = col.delete(1).unwrap();
+        assert!(found);
+    }
+
+    #[test]
+    fn delete_returns_false_when_not_found() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("test", IndexType::Flat);
+        let mut col = Collection::create(&path, meta).unwrap();
+
+        let found = col.delete(999).unwrap();
+        assert!(!found);
+    }
+
+    #[test]
+    fn double_delete_returns_false_second_time() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("test", IndexType::Flat);
+        let mut col = Collection::create(&path, meta).unwrap();
+
+        col.upsert(1, vec![1.0, 0.0, 0.0], None).unwrap();
+        assert!(col.delete(1).unwrap());
+        assert!(!col.delete(1).unwrap());
+        assert_eq!(col.count(), 0);
+    }
+
+    #[test]
+    fn delete_removes_payload() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("test", IndexType::Flat);
+        let mut col = Collection::create(&path, meta).unwrap();
+
+        col.upsert(1, vec![1.0, 0.0, 0.0], Some(serde_json::json!({"k": "v"}))).unwrap();
+        col.delete(1).unwrap();
+
+        // Re-add without payload — old payload should not reappear
+        col.upsert(1, vec![1.0, 0.0, 0.0], None).unwrap();
+        let results = col.search(&[1.0, 0.0, 0.0], 1, None).unwrap();
+        assert!(results[0].payload.is_none());
+    }
+
+    // ── Hybrid search normalization edge case ─────────────────────────────────
+
+    #[test]
+    fn hybrid_search_identical_dense_scores() {
+        use crate::index::sparse::SparseVector;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("hybrid_norm", IndexType::Flat);
+        let mut col = Collection::create(&path, meta).unwrap();
+
+        // Two identical dense vectors — dense distances will be equal (min == max)
+        col.upsert_hybrid(
+            1, vec![1.0, 0.0, 0.0],
+            Some(SparseVector::new(vec![0], vec![1.0])),
+            None,
+        ).unwrap();
+        col.upsert_hybrid(
+            2, vec![1.0, 0.0, 0.0],
+            Some(SparseVector::new(vec![0], vec![0.5])),
+            None,
+        ).unwrap();
+
+        // Should not panic or produce NaN despite dense_range → max(eps, 0)
+        let results = col.search_hybrid(
+            &[1.0, 0.0, 0.0],
+            &SparseVector::new(vec![0], vec![1.0]),
+            2,
+            0.5,
+            0.5,
+            None,
+        ).unwrap();
+        assert_eq!(results.len(), 2);
+        // All scores should be finite
+        for r in &results {
+            assert!(r.score.is_finite(), "score should be finite, got {}", r.score);
+        }
+        // id=1 has higher sparse score, so should rank first
+        assert_eq!(results[0].id, 1);
+    }
+
+    #[test]
+    fn hybrid_search_k_zero_returns_empty() {
+        use crate::index::sparse::SparseVector;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("hybrid", IndexType::Flat);
+        let mut col = Collection::create(&path, meta).unwrap();
+        col.upsert(1, vec![1.0, 0.0, 0.0], None).unwrap();
+
+        let results = col.search_hybrid(
+            &[1.0, 0.0, 0.0],
+            &SparseVector::new(vec![0], vec![1.0]),
+            0,
+            0.5,
+            0.5,
+            None,
+        ).unwrap();
+        assert!(results.is_empty());
+    }
+
+    // ── Count method ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn count_reflects_upserts_and_deletes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("test", IndexType::Flat);
+        let mut col = Collection::create(&path, meta).unwrap();
+
+        assert_eq!(col.count(), 0);
+        col.upsert(1, vec![1.0, 0.0, 0.0], None).unwrap();
+        assert_eq!(col.count(), 1);
+        col.upsert(2, vec![0.0, 1.0, 0.0], None).unwrap();
+        assert_eq!(col.count(), 2);
+        // Re-upsert same id should not increase count
+        col.upsert(1, vec![0.5, 0.5, 0.0], None).unwrap();
+        assert_eq!(col.count(), 2);
+        col.delete(1).unwrap();
+        assert_eq!(col.count(), 1);
+        col.delete(2).unwrap();
+        assert_eq!(col.count(), 0);
+    }
+
+    // ── Multiple index types ──────────────────────────────────────────────────
+
+    #[test]
+    fn create_with_quantized_flat() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("qf", IndexType::QuantizedFlat);
+        let mut col = Collection::create(&path, meta).unwrap();
+
+        col.upsert(1, vec![1.0, 0.0, 0.0], None).unwrap();
+        col.upsert(2, vec![0.0, 1.0, 0.0], None).unwrap();
+        assert_eq!(col.count(), 2);
+
+        let results = col.search(&[1.0, 0.0, 0.0], 1, None).unwrap();
+        assert_eq!(results[0].id, 1);
+
+        // Verify persistence
+        drop(col);
+        let loaded = Collection::load(&path).unwrap();
+        assert_eq!(loaded.count(), 2);
+        assert_eq!(loaded.meta().index_type, IndexType::QuantizedFlat);
+    }
+
+    #[test]
+    fn create_with_fp16_flat() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("fp16", IndexType::Fp16Flat);
+        let mut col = Collection::create(&path, meta).unwrap();
+
+        col.upsert(1, vec![1.0, 0.0, 0.0], None).unwrap();
+        col.upsert(2, vec![0.0, 1.0, 0.0], None).unwrap();
+        assert_eq!(col.count(), 2);
+
+        let results = col.search(&[1.0, 0.0, 0.0], 1, None).unwrap();
+        assert_eq!(results[0].id, 1);
+
+        drop(col);
+        let loaded = Collection::load(&path).unwrap();
+        assert_eq!(loaded.count(), 2);
+        assert_eq!(loaded.meta().index_type, IndexType::Fp16Flat);
+    }
+
+    #[test]
+    fn create_with_binary_flat() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("bin", IndexType::BinaryFlat);
+        let mut col = Collection::create(&path, meta).unwrap();
+
+        col.upsert(1, vec![1.0, 0.0, 0.0], None).unwrap();
+        col.upsert(2, vec![0.0, 1.0, 0.0], None).unwrap();
+        assert_eq!(col.count(), 2);
+
+        let results = col.search(&[1.0, 0.0, 0.0], 1, None).unwrap();
+        // Binary quantization is lossy; just verify we get a result
+        assert!(!results.is_empty());
+
+        drop(col);
+        let loaded = Collection::load(&path).unwrap();
+        assert_eq!(loaded.count(), 2);
+        assert_eq!(loaded.meta().index_type, IndexType::BinaryFlat);
+    }
+
+    #[test]
+    fn create_with_hnsw() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let mut meta = make_meta("hnsw", IndexType::Hnsw);
+        meta.hnsw_config = Some(HnswConfig::default());
+        let mut col = Collection::create(&path, meta).unwrap();
+
+        col.upsert(1, vec![1.0, 0.0, 0.0], None).unwrap();
+        col.upsert(2, vec![0.0, 1.0, 0.0], None).unwrap();
+        col.upsert(3, vec![0.0, 0.0, 1.0], None).unwrap();
+        assert_eq!(col.count(), 3);
+
+        let results = col.search(&[1.0, 0.0, 0.0], 1, None).unwrap();
+        assert_eq!(results[0].id, 1);
+    }
+
+    // ── Payload upsert-clears-old-payload ─────────────────────────────────────
+
+    #[test]
+    fn upsert_with_none_payload_clears_previous() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("test", IndexType::Flat);
+        let mut col = Collection::create(&path, meta).unwrap();
+
+        col.upsert(1, vec![1.0, 0.0, 0.0], Some(serde_json::json!({"k": "v"}))).unwrap();
+        col.upsert(1, vec![1.0, 0.0, 0.0], None).unwrap();
+
+        let results = col.search(&[1.0, 0.0, 0.0], 1, None).unwrap();
+        assert!(results[0].payload.is_none());
+    }
+
+    // ── Snapshot with payloads ────────────────────────────────────────────────
+
+    #[test]
+    fn snapshot_preserves_payloads() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("snap_pay", IndexType::Flat);
+        let mut col = Collection::create(&path, meta).unwrap();
+
+        col.upsert(1, vec![1.0, 0.0, 0.0], Some(serde_json::json!({"tag": "snap"}))).unwrap();
+        col.create_snapshot("v1").unwrap();
+
+        // Mutate payload
+        col.upsert(1, vec![1.0, 0.0, 0.0], Some(serde_json::json!({"tag": "changed"}))).unwrap();
+
+        // Restore and verify original payload
+        col.restore_snapshot("v1").unwrap();
+        let results = col.search(&[1.0, 0.0, 0.0], 1, None).unwrap();
+        assert_eq!(results[0].payload.as_ref().unwrap()["tag"], "snap");
+    }
+
+    // ── Meta accessor ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn meta_accessor_returns_correct_values() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("my_col", IndexType::Flat);
+        let col = Collection::create(&path, meta).unwrap();
+
+        assert_eq!(col.meta().name, "my_col");
+        assert_eq!(col.meta().dimensions, 3);
+        assert_eq!(col.meta().metric, Metric::L2);
+        assert_eq!(col.meta().index_type, IndexType::Flat);
+    }
 }

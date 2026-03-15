@@ -409,4 +409,208 @@ mod tests {
         assert!(decoded[4] > 0.0);
         assert!(decoded[5] < 0.0);
     }
+
+    // ── add_batch_raw tests ─────────────────────────────────────────────
+
+    #[test]
+    fn add_batch_raw_basic() {
+        let mut idx = BinaryFlatIndex::new(4, Metric::L2);
+        let data = vec![
+            1.0, 1.0, -1.0, -1.0, // id 0
+            -1.0, -1.0, 1.0, 1.0, // id 1
+            1.0, -1.0, 1.0, -1.0, // id 2
+        ];
+        idx.add_batch_raw(&data, 4, 0).unwrap();
+        assert_eq!(idx.len(), 3);
+    }
+
+    #[test]
+    fn add_batch_raw_search_after() {
+        let mut idx = BinaryFlatIndex::new(4, Metric::L2);
+        let data = vec![
+            1.0, 1.0, 1.0, 1.0,
+            -1.0, -1.0, -1.0, -1.0,
+        ];
+        idx.add_batch_raw(&data, 4, 10).unwrap();
+        let results = idx.search(&[1.0, 1.0, 1.0, 1.0], 1).unwrap();
+        assert_eq!(results[0].id, 10);
+    }
+
+    #[test]
+    fn add_batch_raw_empty_buffer() {
+        let mut idx = BinaryFlatIndex::new(4, Metric::L2);
+        idx.add_batch_raw(&[], 4, 0).unwrap();
+        assert_eq!(idx.len(), 0);
+    }
+
+    #[test]
+    fn add_batch_raw_dim_mismatch() {
+        let mut idx = BinaryFlatIndex::new(4, Metric::L2);
+        let err = idx.add_batch_raw(&[1.0; 6], 3, 0).unwrap_err();
+        assert!(matches!(err, VectorDbError::DimensionMismatch { expected: 4, got: 3 }));
+    }
+
+    #[test]
+    fn add_batch_raw_not_multiple_of_dim() {
+        let mut idx = BinaryFlatIndex::new(4, Metric::L2);
+        let err = idx.add_batch_raw(&[1.0; 5], 4, 0).unwrap_err();
+        assert!(matches!(err, VectorDbError::InvalidConfig(_)));
+    }
+
+    // ── DotProduct metric ───────────────────────────────────────────────
+
+    #[test]
+    fn dot_product_metric_ordering() {
+        let mut idx = BinaryFlatIndex::new(4, Metric::DotProduct);
+        // All positive — max agreement with positive query
+        idx.add(1, &[1.0, 1.0, 1.0, 1.0]).unwrap();
+        // All negative — min agreement
+        idx.add(2, &[-1.0, -1.0, -1.0, -1.0]).unwrap();
+        // Half match
+        idx.add(3, &[1.0, 1.0, -1.0, -1.0]).unwrap();
+
+        let results = idx.search(&[1.0, 1.0, 1.0, 1.0], 3).unwrap();
+        // id=1 should be closest (most similar) under DotProduct
+        assert_eq!(results[0].id, 1);
+        // id=2 should be farthest
+        assert_eq!(results[2].id, 2);
+    }
+
+    // ── k > total vectors ───────────────────────────────────────────────
+
+    #[test]
+    fn k_greater_than_total_vectors() {
+        let mut idx = BinaryFlatIndex::new(4, Metric::L2);
+        for i in 0..5u64 {
+            idx.add(i, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        }
+        let results = idx.search(&[1.0, 0.0, 0.0, 0.0], 100).unwrap();
+        assert_eq!(results.len(), 5);
+    }
+
+    // ── Mixed add() and add_batch_raw() ─────────────────────────────────
+
+    #[test]
+    fn mixed_add_and_batch() {
+        let mut idx = BinaryFlatIndex::new(4, Metric::L2);
+        idx.add(0, &[1.0, 1.0, 1.0, 1.0]).unwrap();
+        idx.add(1, &[-1.0, -1.0, -1.0, -1.0]).unwrap();
+        let batch = vec![
+            1.0, -1.0, 1.0, -1.0, // id 100
+            -1.0, 1.0, -1.0, 1.0, // id 101
+        ];
+        idx.add_batch_raw(&batch, 4, 100).unwrap();
+        assert_eq!(idx.len(), 4);
+
+        // All 4 vectors should be searchable
+        let results = idx.search(&[1.0, 1.0, 1.0, 1.0], 4).unwrap();
+        assert_eq!(results.len(), 4);
+        assert_eq!(results[0].id, 0); // exact match
+    }
+
+    // ── Delete after batch insert ───────────────────────────────────────
+
+    #[test]
+    fn delete_after_batch_insert() {
+        let mut idx = BinaryFlatIndex::new(4, Metric::L2);
+        let data = vec![
+            1.0, 1.0, 1.0, 1.0,     // id 0
+            -1.0, -1.0, -1.0, -1.0,  // id 1
+            1.0, -1.0, 1.0, -1.0,    // id 2
+        ];
+        idx.add_batch_raw(&data, 4, 0).unwrap();
+        assert_eq!(idx.len(), 3);
+
+        assert!(idx.delete(1));
+        assert_eq!(idx.len(), 2);
+
+        let results = idx.search(&[-1.0, -1.0, -1.0, -1.0], 3).unwrap();
+        assert_eq!(results.len(), 2);
+        // Deleted id=1 must not appear
+        assert!(results.iter().all(|r| r.id != 1));
+    }
+
+    // ── Word-boundary dimensions ────────────────────────────────────────
+
+    #[test]
+    fn dim_63_near_word_boundary() {
+        let dim = 63;
+        let mut idx = BinaryFlatIndex::new(dim, Metric::L2);
+        let v: Vec<f32> = (0..dim).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
+        idx.add(1, &v).unwrap();
+        let results = idx.search(&v, 1).unwrap();
+        assert_eq!(results[0].id, 1);
+        assert!(results[0].distance < 1e-6);
+    }
+
+    #[test]
+    fn dim_64_exact_word_boundary() {
+        let dim = 64;
+        let mut idx = BinaryFlatIndex::new(dim, Metric::L2);
+        let v: Vec<f32> = (0..dim).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
+        idx.add(1, &v).unwrap();
+        let results = idx.search(&v, 1).unwrap();
+        assert_eq!(results[0].id, 1);
+        assert!(results[0].distance < 1e-6);
+    }
+
+    #[test]
+    fn dim_65_just_past_word_boundary() {
+        let dim = 65;
+        let mut idx = BinaryFlatIndex::new(dim, Metric::L2);
+        let v: Vec<f32> = (0..dim).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
+        idx.add(1, &v).unwrap();
+        let q_opposite: Vec<f32> = v.iter().map(|x| -x).collect();
+        idx.add(2, &q_opposite).unwrap();
+
+        let results = idx.search(&v, 1).unwrap();
+        assert_eq!(results[0].id, 1);
+    }
+
+    #[test]
+    fn dim_128_two_words() {
+        let dim = 128;
+        let mut idx = BinaryFlatIndex::new(dim, Metric::Cosine);
+        let v1: Vec<f32> = (0..dim).map(|_| 1.0).collect();
+        let v2: Vec<f32> = (0..dim).map(|_| -1.0).collect();
+        idx.add(1, &v1).unwrap();
+        idx.add(2, &v2).unwrap();
+        let results = idx.search(&v1, 2).unwrap();
+        assert_eq!(results[0].id, 1);
+        assert_eq!(results[1].id, 2);
+    }
+
+    // ── Zero-norm vector ────────────────────────────────────────────────
+
+    #[test]
+    fn zero_norm_vector() {
+        let mut idx = BinaryFlatIndex::new(4, Metric::L2);
+        // All zeros — norm is 0, but encode should not panic
+        idx.add(1, &[0.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.add(2, &[1.0, 1.0, 1.0, 1.0]).unwrap();
+        let results = idx.search(&[1.0, 1.0, 1.0, 1.0], 2).unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn zero_norm_decode_approx() {
+        // zero-norm vector decode should not panic or produce NaN
+        let v = vec![0.0f32; 8];
+        let bv = BinaryVec::encode(&v);
+        assert!((bv.norm - 0.0).abs() < 1e-6);
+        let decoded = bv.decode_approx(8);
+        // scale = 0/sqrt(8) = 0, so all decoded values should be 0
+        assert!(decoded.iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn dot_product_zero_norm_no_nan() {
+        let mut idx = BinaryFlatIndex::new(4, Metric::DotProduct);
+        idx.add(1, &[0.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.add(2, &[1.0, 1.0, 1.0, 1.0]).unwrap();
+        let results = idx.search(&[1.0, 1.0, 1.0, 1.0], 2).unwrap();
+        assert_eq!(results.len(), 2);
+        // No NaN distances
+        assert!(results.iter().all(|r| !r.distance.is_nan()));
+    }
 }

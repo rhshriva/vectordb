@@ -344,4 +344,170 @@ mod tests {
         ids.sort();
         assert_eq!(ids, vec![10, 20]);
     }
+
+    // ── add_batch_raw tests ─────────────────────────────────────────────
+
+    #[test]
+    fn add_batch_raw_basic() {
+        let mut idx = QuantizedFlatIndex::new(3, Metric::L2);
+        let data = vec![
+            1.0, 0.0, 0.0,
+            0.0, 1.0, 0.0,
+            0.0, 0.0, 1.0,
+        ];
+        idx.add_batch_raw(&data, 3, 0).unwrap();
+        assert_eq!(idx.len(), 3);
+    }
+
+    #[test]
+    fn add_batch_raw_search_after() {
+        let mut idx = QuantizedFlatIndex::new(3, Metric::L2);
+        let data = vec![
+            1.0, 0.0, 0.0,
+            0.0, 1.0, 0.0,
+        ];
+        idx.add_batch_raw(&data, 3, 10).unwrap();
+        let results = idx.search(&[1.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(results[0].id, 10);
+        assert!(results[0].distance < 0.05);
+    }
+
+    #[test]
+    fn add_batch_raw_empty_buffer() {
+        let mut idx = QuantizedFlatIndex::new(3, Metric::L2);
+        idx.add_batch_raw(&[], 3, 0).unwrap();
+        assert_eq!(idx.len(), 0);
+    }
+
+    #[test]
+    fn add_batch_raw_dim_mismatch() {
+        let mut idx = QuantizedFlatIndex::new(3, Metric::L2);
+        let err = idx.add_batch_raw(&[1.0; 4], 2, 0).unwrap_err();
+        assert!(matches!(err, VectorDbError::DimensionMismatch { expected: 3, got: 2 }));
+    }
+
+    #[test]
+    fn add_batch_raw_not_multiple_of_dim() {
+        let mut idx = QuantizedFlatIndex::new(3, Metric::L2);
+        let err = idx.add_batch_raw(&[1.0; 5], 3, 0).unwrap_err();
+        assert!(matches!(err, VectorDbError::InvalidConfig(_)));
+    }
+
+    // ── DotProduct metric ───────────────────────────────────────────────
+
+    #[test]
+    fn dot_product_metric_ordering() {
+        let mut idx = QuantizedFlatIndex::new(3, Metric::DotProduct);
+        idx.add(1, &[1.0, 0.0, 0.0]).unwrap();
+        idx.add(2, &[0.0, 1.0, 0.0]).unwrap();
+        idx.add(3, &[0.5, 0.5, 0.0]).unwrap();
+
+        let results = idx.search(&[1.0, 0.0, 0.0], 3).unwrap();
+        // id=1 should be closest (highest dot product → most negative distance)
+        assert_eq!(results[0].id, 1);
+    }
+
+    // ── k > total vectors ───────────────────────────────────────────────
+
+    #[test]
+    fn k_greater_than_total_vectors() {
+        let mut idx = QuantizedFlatIndex::new(3, Metric::L2);
+        for i in 0..5u64 {
+            idx.add(i, &unit_vec(3, (i as usize) % 3)).unwrap();
+        }
+        let results = idx.search(&[1.0, 0.0, 0.0], 100).unwrap();
+        assert_eq!(results.len(), 5);
+    }
+
+    // ── Mixed add() and add_batch_raw() ─────────────────────────────────
+
+    #[test]
+    fn mixed_add_and_batch() {
+        let mut idx = QuantizedFlatIndex::new(3, Metric::L2);
+        idx.add(0, &[1.0, 0.0, 0.0]).unwrap();
+        idx.add(1, &[0.0, 1.0, 0.0]).unwrap();
+        let batch = vec![
+            0.0, 0.0, 1.0,  // id 100
+            0.5, 0.5, 0.0,  // id 101
+        ];
+        idx.add_batch_raw(&batch, 3, 100).unwrap();
+        assert_eq!(idx.len(), 4);
+
+        let results = idx.search(&[1.0, 0.0, 0.0], 4).unwrap();
+        assert_eq!(results.len(), 4);
+        assert_eq!(results[0].id, 0);
+    }
+
+    // ── Delete after batch insert ───────────────────────────────────────
+
+    #[test]
+    fn delete_after_batch_insert() {
+        let mut idx = QuantizedFlatIndex::new(3, Metric::L2);
+        let data = vec![
+            1.0, 0.0, 0.0,
+            0.0, 1.0, 0.0,
+            0.0, 0.0, 1.0,
+        ];
+        idx.add_batch_raw(&data, 3, 0).unwrap();
+        assert_eq!(idx.len(), 3);
+
+        assert!(idx.delete(1));
+        assert_eq!(idx.len(), 2);
+
+        let results = idx.search(&[0.0, 1.0, 0.0], 3).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| r.id != 1));
+    }
+
+    // ── Single outlier value (scale edge case) ──────────────────────────
+
+    #[test]
+    fn single_outlier_scale_edge_case() {
+        // One large outlier dominates scale, small values lose precision
+        let v = vec![100.0, 0.001, 0.002, -0.001];
+        let qv = QuantizedVec::encode(&v);
+        // scale = 127 / 100 = 1.27
+        // small values * 1.27 rounds to 0 → lost precision
+        let mut out = Vec::new();
+        qv.decode_into(&mut out);
+        // The outlier should decode close to 100.0
+        assert!((out[0] - 100.0).abs() < 1.0, "outlier decoded={}", out[0]);
+        // Small values are clamped near 0 due to scale
+        assert!(out[1].abs() < 1.0);
+    }
+
+    // ── All-same values ─────────────────────────────────────────────────
+
+    #[test]
+    fn all_same_values() {
+        let v = vec![0.5, 0.5, 0.5, 0.5];
+        let qv = QuantizedVec::encode(&v);
+        let mut out = Vec::new();
+        qv.decode_into(&mut out);
+        // All values should decode to approximately the same value
+        for &x in &out {
+            assert!((x - 0.5).abs() < 0.01, "decoded={x}");
+        }
+    }
+
+    #[test]
+    fn all_same_negative_values() {
+        let v = vec![-0.3, -0.3, -0.3, -0.3];
+        let qv = QuantizedVec::encode(&v);
+        let mut out = Vec::new();
+        qv.decode_into(&mut out);
+        for &x in &out {
+            assert!((x - (-0.3)).abs() < 0.01, "decoded={x}");
+        }
+    }
+
+    #[test]
+    fn all_same_values_search() {
+        // Index with all-same vectors; search should still work
+        let mut idx = QuantizedFlatIndex::new(4, Metric::L2);
+        idx.add(1, &[0.5, 0.5, 0.5, 0.5]).unwrap();
+        idx.add(2, &[0.5, 0.5, 0.5, 0.5]).unwrap();
+        let results = idx.search(&[0.5, 0.5, 0.5, 0.5], 2).unwrap();
+        assert_eq!(results.len(), 2);
+    }
 }
