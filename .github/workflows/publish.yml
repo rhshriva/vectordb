@@ -73,11 +73,15 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install maturin and zig
-        run: pip install maturin ziglang
+      - name: Install maturin
+        run: pip install maturin
+
+      - name: Install ziglang (non-Windows only)
+        if: runner.os != 'Windows'
+        run: pip install ziglang
 
       - name: Build wheel
-        run: maturin build --release --zig -m crates/quiver-python/Cargo.toml --target ${{ matrix.target }}
+        run: maturin build --release ${{ runner.os != 'Windows' && '--zig' || '' }} -m crates/quiver-python/Cargo.toml --target ${{ matrix.target }}
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v5
