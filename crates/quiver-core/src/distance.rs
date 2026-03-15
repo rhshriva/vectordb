@@ -671,4 +671,187 @@ mod tests {
             }
         }
     }
+
+    // ── Additional coverage tests ────────────────────────────────────────────
+
+    #[test]
+    fn fixup_distance_l2_applies_sqrt() {
+        assert_abs_diff_eq!(Metric::L2.fixup_distance(4.0), 2.0, epsilon = 1e-5);
+        assert_abs_diff_eq!(Metric::L2.fixup_distance(0.0), 0.0, epsilon = 1e-5);
+    }
+
+    #[test]
+    fn fixup_distance_cosine_and_dot_are_noop() {
+        assert_abs_diff_eq!(Metric::Cosine.fixup_distance(0.5), 0.5, epsilon = 1e-5);
+        assert_abs_diff_eq!(Metric::DotProduct.fixup_distance(-3.0), -3.0, epsilon = 1e-5);
+    }
+
+    #[test]
+    fn distance_ord_l2_returns_squared() {
+        let a = vec![0.0_f32, 0.0, 0.0];
+        let b = vec![3.0_f32, 4.0, 0.0];
+        assert_abs_diff_eq!(Metric::L2.distance_ord(&a, &b), 25.0, epsilon = 1e-3);
+    }
+
+    #[test]
+    fn distance_ord_cosine_same_as_distance() {
+        let a = vec![1.0_f32, 2.0, 3.0];
+        let b = vec![4.0_f32, 5.0, 6.0];
+        assert_abs_diff_eq!(
+            Metric::Cosine.distance_ord(&a, &b),
+            Metric::Cosine.distance(&a, &b),
+            epsilon = 1e-5
+        );
+    }
+
+    #[test]
+    fn distance_ord_dot_same_as_distance() {
+        let a = vec![1.0_f32, 2.0, 3.0];
+        let b = vec![4.0_f32, 5.0, 6.0];
+        assert_abs_diff_eq!(
+            Metric::DotProduct.distance_ord(&a, &b),
+            Metric::DotProduct.distance(&a, &b),
+            epsilon = 1e-5
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "vector dimension mismatch")]
+    fn metric_distance_panics_on_dimension_mismatch() {
+        let a = vec![1.0_f32, 2.0];
+        let b = vec![1.0_f32, 2.0, 3.0];
+        Metric::L2.distance(&a, &b);
+    }
+
+    #[test]
+    fn l2_squared_zero_vectors() {
+        let z = vec![0.0_f32; 8];
+        assert_abs_diff_eq!(l2_squared(&z, &z), 0.0, epsilon = 1e-5);
+    }
+
+    #[test]
+    fn dot_zero_vectors() {
+        let z = vec![0.0_f32; 8];
+        assert_abs_diff_eq!(dot(&z, &z), 0.0, epsilon = 1e-5);
+    }
+
+    #[test]
+    fn l2_squared_identical_vectors() {
+        let v = vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+        assert_abs_diff_eq!(l2_squared(&v, &v), 0.0, epsilon = 1e-5);
+    }
+
+    #[test]
+    fn dot_self_is_squared_norm() {
+        let v = vec![3.0_f32, 4.0];
+        assert_abs_diff_eq!(dot(&v, &v), 25.0, epsilon = 1e-5);
+    }
+
+    #[test]
+    fn cosine_both_zero_vectors() {
+        let z = vec![0.0_f32, 0.0];
+        assert_abs_diff_eq!(cosine_distance(&z, &z), 1.0, epsilon = 1e-5);
+    }
+
+    #[test]
+    fn normalize_preserves_direction() {
+        let mut v = vec![3.0_f32, 4.0];
+        normalize(&mut v);
+        assert_abs_diff_eq!(v[0], 0.6, epsilon = 1e-5);
+        assert_abs_diff_eq!(v[1], 0.8, epsilon = 1e-5);
+    }
+
+    #[test]
+    fn l2_large_values() {
+        let a = vec![1e10_f32, 1e10];
+        let b = vec![-1e10_f32, -1e10];
+        let d = l2(&a, &b);
+        assert!(d.is_finite());
+        assert!(d > 0.0);
+    }
+
+    #[test]
+    fn dot_product_distance_negates_dot() {
+        let a = vec![1.0_f32, 0.0];
+        let b = vec![1.0_f32, 0.0];
+        assert_abs_diff_eq!(dot_product_distance(&a, &b), -1.0, epsilon = 1e-5);
+    }
+
+    #[test]
+    fn batch4_with_non_aligned_length() {
+        let n = 13;
+        let query: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let vecs: Vec<Vec<f32>> = (0..4)
+            .map(|k| (0..n).map(|i| (i + k * 5) as f32).collect())
+            .collect();
+
+        let batch_l2 = l2_squared_batch4(&query, [&vecs[0], &vecs[1], &vecs[2], &vecs[3]]);
+        for k in 0..4 {
+            let ref_l2 = l2_squared(&query, &vecs[k]);
+            assert!(
+                (batch_l2[k] - ref_l2).abs() < 1e-2,
+                "batch4 l2 tail mismatch at k={k}"
+            );
+        }
+
+        let batch_dot = dot_batch4(&query, [&vecs[0], &vecs[1], &vecs[2], &vecs[3]]);
+        for k in 0..4 {
+            let ref_dot = dot(&query, &vecs[k]);
+            assert!(
+                (batch_dot[k] - ref_dot).abs() < 1e-2,
+                "batch4 dot tail mismatch at k={k}"
+            );
+        }
+    }
+
+    #[test]
+    fn batch4_empty_vectors() {
+        let query: Vec<f32> = vec![];
+        let v: Vec<f32> = vec![];
+        let batch = l2_squared_batch4(&query, [&v, &v, &v, &v]);
+        assert_eq!(batch, [0.0, 0.0, 0.0, 0.0]);
+        let batch = dot_batch4(&query, [&v, &v, &v, &v]);
+        assert_eq!(batch, [0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn metric_distance_ord_batch4_dot_product_negates() {
+        let query = vec![1.0_f32, 2.0, 3.0, 4.0];
+        let v = vec![1.0_f32, 1.0, 1.0, 1.0];
+        let batch = Metric::DotProduct.distance_ord_batch4(&query, [&v, &v, &v, &v]);
+        let expected = -dot(&query, &v);
+        for k in 0..4 {
+            assert_abs_diff_eq!(batch[k], expected, epsilon = 1e-5);
+        }
+    }
+
+    #[test]
+    fn scalar_l2_squared_directly() {
+        let a = vec![1.0_f32, 2.0, 3.0];
+        let b = vec![4.0_f32, 5.0, 6.0];
+        assert_abs_diff_eq!(scalar::l2_squared(&a, &b), 27.0, epsilon = 1e-5);
+    }
+
+    #[test]
+    fn scalar_dot_directly() {
+        let a = vec![1.0_f32, 2.0, 3.0];
+        let b = vec![4.0_f32, 5.0, 6.0];
+        assert_abs_diff_eq!(scalar::dot(&a, &b), 32.0, epsilon = 1e-5);
+    }
+
+    #[test]
+    fn cosine_parallel_scaled_vectors() {
+        let a = vec![1.0_f32, 2.0, 3.0];
+        let b = vec![2.0_f32, 4.0, 6.0];
+        assert_abs_diff_eq!(cosine_distance(&a, &b), 0.0, epsilon = 1e-5);
+    }
+
+    #[test]
+    fn fixup_roundtrip_l2() {
+        let a = vec![0.0_f32, 0.0];
+        let b = vec![3.0_f32, 4.0];
+        let ord = Metric::L2.distance_ord(&a, &b);
+        let fixed = Metric::L2.fixup_distance(ord);
+        assert_abs_diff_eq!(fixed, Metric::L2.distance(&a, &b), epsilon = 1e-3);
+    }
 }

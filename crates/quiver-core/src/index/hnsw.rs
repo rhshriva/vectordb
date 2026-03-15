@@ -111,7 +111,7 @@ pub struct InsertStats {
 // ── Priority queue element ──────────────────────────────────────────────
 
 /// Candidate for priority queue. 8 bytes (f32 distance + u32 id).
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct Candidate {
     distance: f32,
     id: u32,
@@ -2505,5 +2505,768 @@ mod tests {
             let r = idx.search(&q, 3).unwrap();
             assert!(!r.is_empty());
         }
+    }
+
+    // ── Instrumented insert tests ─────────────────────────────────────
+
+    #[test]
+    fn add_batch_instrumented_basic() {
+        // Tests insert_instrumented + search_layer_instrumented paths
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 20, m: 8 };
+        let mut idx = HnswIndex::new(3, Metric::L2, cfg);
+        let entries: Vec<(u64, Vec<f32>)> = (0..50u64)
+            .map(|i| (i, vec![i as f32, 0.0, 0.0]))
+            .collect();
+        let stats = idx.add_batch_instrumented(&entries);
+        assert_eq!(idx.len(), 50);
+        // All timing stats should be non-negative (some might be zero for first insert)
+        assert!(stats.random_level.as_nanos() >= 0);
+        assert!(stats.clone_vec.as_nanos() >= 0);
+        assert!(stats.node_insert.as_nanos() > 0);
+        // search_layer should have been called for most inserts
+        assert!(stats.search_layer.as_nanos() > 0);
+        // set_neighbors should have been called
+        assert!(stats.set_neighbors.as_nanos() > 0);
+        // Verify search works after instrumented insert
+        let r = idx.search(&[25.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(r[0].id, 25);
+    }
+
+    #[test]
+    fn add_batch_instrumented_single_entry() {
+        // First instrumented insert: no entry point, so insert returns early
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 20, m: 8 };
+        let mut idx = HnswIndex::new(2, Metric::L2, cfg);
+        let entries = vec![(0u64, vec![1.0, 2.0])];
+        let stats = idx.add_batch_instrumented(&entries);
+        assert_eq!(idx.len(), 1);
+        // Only node_insert and random_level should have nonzero time (no search on first insert)
+        assert!(stats.node_insert.as_nanos() > 0);
+        assert!(stats.search_layer.as_nanos() == 0); // no search for first node
+    }
+
+    #[test]
+    fn add_batch_instrumented_cosine() {
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 20, m: 8 };
+        let mut idx = HnswIndex::new(4, Metric::Cosine, cfg);
+        let entries: Vec<(u64, Vec<f32>)> = (1..=30u64)
+            .map(|i| (i, vec![i as f32, 1.0, 0.0, 0.0]))
+            .collect();
+        let stats = idx.add_batch_instrumented(&entries);
+        assert_eq!(idx.len(), 30);
+        assert!(stats.sl_distance.as_nanos() > 0);
+        assert!(stats.sl_heap_ops.as_nanos() > 0);
+    }
+
+    #[test]
+    fn add_batch_instrumented_dot_product() {
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 20, m: 8 };
+        let mut idx = HnswIndex::new(3, Metric::DotProduct, cfg);
+        let entries: Vec<(u64, Vec<f32>)> = (1..=30u64)
+            .map(|i| (i, vec![i as f32, 0.0, 0.0]))
+            .collect();
+        let stats = idx.add_batch_instrumented(&entries);
+        assert_eq!(idx.len(), 30);
+        assert!(stats.sl_distance.as_nanos() > 0);
+    }
+
+    #[test]
+    fn add_batch_instrumented_large_triggers_pruning() {
+        // Insert enough vectors with small M to trigger neighbor pruning in instrumented path
+        let cfg = HnswConfig { ef_construction: 50, ef_search: 20, m: 4 };
+        let mut idx = HnswIndex::new(2, Metric::L2, cfg);
+        // m=4, m_max0=8: after inserting ~20+ vectors, pruning should happen
+        let entries: Vec<(u64, Vec<f32>)> = (0..100u64)
+            .map(|i| (i, vec![(i as f32) * 0.1, (i as f32) * 0.05]))
+            .collect();
+        let stats = idx.add_batch_instrumented(&entries);
+        assert_eq!(idx.len(), 100);
+        // Pruning should have been triggered at least once
+        assert!(stats.pruning.as_nanos() > 0, "pruning should be triggered with m=4 and 100 vectors");
+        assert!(stats.back_edges.as_nanos() > 0);
+        // Verify search correctness
+        let r = idx.search(&[5.0, 2.5], 1).unwrap();
+        assert_eq!(r.len(), 1);
+    }
+
+    #[test]
+    fn add_batch_instrumented_empty() {
+        let cfg = HnswConfig::default();
+        let mut idx = HnswIndex::new(3, Metric::L2, cfg);
+        let entries: Vec<(u64, Vec<f32>)> = vec![];
+        let stats = idx.add_batch_instrumented(&entries);
+        assert_eq!(idx.len(), 0);
+        assert_eq!(stats.node_insert.as_nanos(), 0);
+    }
+
+    #[test]
+    fn add_batch_instrumented_with_multi_level() {
+        // Use very small m=2 to increase probability of multi-level nodes
+        // This exercises the greedy_descent and upper-layer neighbor paths
+        // in insert_instrumented
+        let cfg = HnswConfig { ef_construction: 50, ef_search: 20, m: 2 };
+        let mut idx = HnswIndex::new(2, Metric::L2, cfg);
+        // Insert many vectors — with m=2, ml = 1/ln(2) ≈ 1.44, so ~50% of nodes
+        // go to level 1+, ~25% to level 2+, etc. With 200 vectors, we'll have
+        // plenty of upper-layer activity.
+        let entries: Vec<(u64, Vec<f32>)> = (0..200u64)
+            .map(|i| {
+                let angle = (i as f32) * 0.1;
+                (i, vec![angle.cos() * (i as f32), angle.sin() * (i as f32)])
+            })
+            .collect();
+        let stats = idx.add_batch_instrumented(&entries);
+        assert_eq!(idx.len(), 200);
+        // With m=2 and 200 vectors, greedy descent should be exercised
+        assert!(stats.greedy_descent.as_nanos() > 0 || stats.search_layer.as_nanos() > 0,
+            "multi-level traversal should have been exercised");
+        // Search should still work
+        let r = idx.search(&[10.0, 5.0], 3).unwrap();
+        assert_eq!(r.len(), 3);
+    }
+
+    #[test]
+    fn add_batch_instrumented_then_delete_and_search() {
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 30, m: 8 };
+        let mut idx = HnswIndex::new(3, Metric::L2, cfg);
+        let entries: Vec<(u64, Vec<f32>)> = (0..30u64)
+            .map(|i| (i, vec![i as f32, 0.0, 0.0]))
+            .collect();
+        idx.add_batch_instrumented(&entries);
+        // Delete some vectors
+        for i in (0..30).step_by(3) {
+            idx.delete(i);
+        }
+        assert_eq!(idx.len(), 20);
+        let r = idx.search(&[15.0, 0.0, 0.0], 5).unwrap();
+        assert!(!r.is_empty());
+        // Deleted IDs should not appear in results
+        for result in &r {
+            assert!(result.id % 3 != 0 || result.id == 0, // id=0 was deleted but edge case
+                "deleted id {} should not appear in results", result.id);
+        }
+    }
+
+    // ── Parallel insert additional edge cases ─────────────────────────
+
+    #[test]
+    fn parallel_insert_micro_batch_size_1() {
+        // micro_batch_size=1 means each vector is its own micro-batch
+        let dim = 4;
+        let n = 20;
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 20, m: 8 };
+        let mut idx = HnswIndex::new(dim, Metric::L2, cfg);
+        let mut data = vec![0.0f32; n * dim];
+        let mut rng = rand::thread_rng();
+        for v in data.iter_mut() {
+            *v = rng.gen::<f32>() * 10.0;
+        }
+        // micro_batch_size=1: bootstrap is 1 vector, then each remaining vector
+        // is a micro-batch of 1 (parallel phase with 1 vector per batch)
+        idx.add_batch_parallel(&data, dim, 0, 2, 1).unwrap();
+        assert_eq!(idx.len(), n);
+        // Verify basic search works
+        let r = idx.search(&data[0..dim], 1).unwrap();
+        assert_eq!(r.len(), 1);
+    }
+
+    #[test]
+    fn parallel_insert_micro_batch_equals_n() {
+        // micro_batch_size == n: all go to bootstrap, no parallel phase
+        let dim = 4;
+        let n = 15;
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 20, m: 8 };
+        let mut idx = HnswIndex::new(dim, Metric::L2, cfg);
+        let mut data = vec![0.0f32; n * dim];
+        let mut rng = rand::thread_rng();
+        for v in data.iter_mut() {
+            *v = rng.gen::<f32>() * 10.0;
+        }
+        idx.add_batch_parallel(&data, dim, 0, 4, n).unwrap();
+        assert_eq!(idx.len(), n);
+    }
+
+    #[test]
+    fn parallel_insert_data_not_divisible_error() {
+        let cfg = HnswConfig::default();
+        let mut idx = HnswIndex::new(4, Metric::L2, cfg);
+        let data = vec![1.0f32; 13]; // 13 not divisible by 4
+        let result = idx.add_batch_parallel(&data, 4, 0, 2, 64);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parallel_insert_zero_threads_uses_default() {
+        let dim = 4;
+        let n = 30;
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 20, m: 8 };
+        let mut idx = HnswIndex::new(dim, Metric::L2, cfg);
+        let mut data = vec![0.0f32; n * dim];
+        let mut rng = rand::thread_rng();
+        for v in data.iter_mut() {
+            *v = rng.gen::<f32>();
+        }
+        // num_threads=0 should use rayon default
+        idx.add_batch_parallel(&data, dim, 0, 0, 10).unwrap();
+        assert_eq!(idx.len(), n);
+    }
+
+    #[test]
+    fn parallel_insert_zero_micro_batch_uses_default() {
+        let dim = 4;
+        let n = 30;
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 20, m: 8 };
+        let mut idx = HnswIndex::new(dim, Metric::L2, cfg);
+        let mut data = vec![0.0f32; n * dim];
+        let mut rng = rand::thread_rng();
+        for v in data.iter_mut() {
+            *v = rng.gen::<f32>();
+        }
+        // micro_batch_size=0 should default to 256
+        idx.add_batch_parallel(&data, dim, 0, 2, 0).unwrap();
+        assert_eq!(idx.len(), n);
+    }
+
+    #[test]
+    fn parallel_insert_with_small_m_triggers_upper_layer_pruning() {
+        // Small m=2 → more upper layers → exercises upper-layer linking/pruning
+        // in insert_batch_parallel Phase C
+        let dim = 8;
+        let n = 300;
+        let cfg = HnswConfig { ef_construction: 50, ef_search: 20, m: 2 };
+        let mut idx = HnswIndex::new(dim, Metric::L2, cfg);
+        let mut data = vec![0.0f32; n * dim];
+        let mut rng = rand::thread_rng();
+        for v in data.iter_mut() {
+            *v = rng.gen::<f32>() * 100.0;
+        }
+        // Use small micro_batch_size to force multiple parallel phases
+        idx.add_batch_parallel(&data, dim, 0, 4, 32).unwrap();
+        assert_eq!(idx.len(), n);
+        // Verify search quality is reasonable
+        let mut found = 0;
+        for i in 0..50 {
+            let q = &data[i * dim..(i + 1) * dim];
+            let r = idx.search(q, 1).unwrap();
+            if !r.is_empty() && r[0].id == i as u64 {
+                found += 1;
+            }
+        }
+        assert!(found > 30, "self-recall too low with m=2 parallel: {}/50", found);
+    }
+
+    #[test]
+    fn parallel_insert_cosine_metric() {
+        let dim = 8;
+        let n = 100;
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 30, m: 8 };
+        let mut idx = HnswIndex::new(dim, Metric::Cosine, cfg);
+        let mut data = vec![0.0f32; n * dim];
+        let mut rng = rand::thread_rng();
+        for v in data.iter_mut() {
+            *v = rng.gen::<f32>() + 0.01; // positive to avoid zero vectors
+        }
+        idx.add_batch_parallel(&data, dim, 0, 2, 20).unwrap();
+        assert_eq!(idx.len(), n);
+        let r = idx.search(&data[0..dim], 1).unwrap();
+        assert_eq!(r.len(), 1);
+    }
+
+    #[test]
+    fn parallel_insert_dot_product_metric() {
+        let dim = 8;
+        let n = 100;
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 30, m: 8 };
+        let mut idx = HnswIndex::new(dim, Metric::DotProduct, cfg);
+        let mut data = vec![0.0f32; n * dim];
+        let mut rng = rand::thread_rng();
+        for v in data.iter_mut() {
+            *v = rng.gen::<f32>();
+        }
+        idx.add_batch_parallel(&data, dim, 0, 2, 20).unwrap();
+        assert_eq!(idx.len(), n);
+        let r = idx.search(&data[0..dim], 3).unwrap();
+        assert_eq!(r.len(), 3);
+    }
+
+    #[test]
+    fn parallel_insert_large_start_id() {
+        // Verify parallel insert works with non-zero start_id
+        let dim = 4;
+        let n = 50;
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 20, m: 8 };
+        let mut idx = HnswIndex::new(dim, Metric::L2, cfg);
+        let mut data = vec![0.0f32; n * dim];
+        let mut rng = rand::thread_rng();
+        for v in data.iter_mut() {
+            *v = rng.gen::<f32>() * 10.0;
+        }
+        idx.add_batch_parallel(&data, dim, 1000, 2, 10).unwrap();
+        assert_eq!(idx.len(), n);
+        // IDs should be 1000..1049
+        let r = idx.search(&data[0..dim], 1).unwrap();
+        assert!(r[0].id >= 1000 && r[0].id < 1050);
+    }
+
+    // ── Save/load graph (non-full-index) ──────────────────────────────
+
+    #[test]
+    fn save_load_graph_round_trip() {
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 20, m: 8 };
+        let mut idx = HnswIndex::new(3, Metric::L2, cfg.clone());
+        for i in 0..20u64 {
+            idx.add(i, &[i as f32, 0.0, 0.0]).unwrap();
+        }
+        let path = std::path::Path::new("/tmp/hnsw_graph_save_test.bin");
+        idx.save_graph(path).unwrap();
+
+        // Load into a fresh index
+        let mut idx2 = HnswIndex::new(3, Metric::L2, cfg);
+        idx2.load_graph_mmap(path).unwrap();
+        assert_eq!(idx2.graph.count, 20);
+        let r = idx2.search(&[5.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(r[0].id, 5);
+    }
+
+    #[test]
+    fn load_graph_mmap_nonexistent_is_ok() {
+        let cfg = HnswConfig::default();
+        let mut idx = HnswIndex::new(3, Metric::L2, cfg);
+        let path = std::path::Path::new("/tmp/hnsw_nonexistent_graph_xyzzy.bin");
+        // Loading a nonexistent file should be a no-op (Ok(()))
+        assert!(idx.load_graph_mmap(path).is_ok());
+        assert_eq!(idx.len(), 0);
+    }
+
+    #[test]
+    fn save_graph_empty_is_noop() {
+        let cfg = HnswConfig::default();
+        let idx = HnswIndex::new(3, Metric::L2, cfg);
+        let path = std::path::Path::new("/tmp/hnsw_empty_graph_save.bin");
+        // Saving empty graph should return Ok (no-op)
+        idx.save_graph(path).unwrap();
+        // File should not exist (save_graph returns early for empty graph)
+        assert!(!path.exists() || std::fs::metadata(path).map(|m| m.len() == 0).unwrap_or(true));
+    }
+
+    // ── Upper layer construction branches ─────────────────────────────
+
+    #[test]
+    fn upper_layer_pruning_with_tiny_m() {
+        // m=2 means m_max0=4, upper max_conn=2. With enough inserts,
+        // upper-layer pruning (lines 612-640) should trigger.
+        let cfg = HnswConfig { ef_construction: 50, ef_search: 20, m: 2 };
+        let mut idx = HnswIndex::new(4, Metric::L2, cfg);
+        // Insert 500 vectors - with m=2, many nodes will have upper layers,
+        // and pruning will trigger when a node gets >2 upper-layer neighbors
+        let mut rng = rand::thread_rng();
+        for i in 0..500u64 {
+            let v: Vec<f32> = (0..4).map(|_| rng.gen::<f32>() * 100.0).collect();
+            idx.add(i, &v).unwrap();
+        }
+        assert_eq!(idx.len(), 500);
+        // Verify the graph has upper layers
+        let max_level = idx.graph.levels.iter().map(|&l| l as usize).max().unwrap_or(0);
+        assert!(max_level >= 1, "with m=2 and 500 vectors, should have multi-level graph");
+        // Search should still work
+        let q: Vec<f32> = (0..4).map(|_| rng.gen::<f32>() * 100.0).collect();
+        let r = idx.search(&q, 5).unwrap();
+        assert_eq!(r.len(), 5);
+    }
+
+    #[test]
+    fn entry_point_updates_on_higher_level_insert() {
+        // Verifies that entry_point is updated when a new node has a higher level
+        // than the current max level. We can't control random_level, but with m=2
+        // and enough inserts, some nodes will be higher level than the initial entry point.
+        let cfg = HnswConfig { ef_construction: 50, ef_search: 20, m: 2 };
+        let mut idx = HnswIndex::new(2, Metric::L2, cfg);
+        // Track all entry point changes
+        for i in 0..200u64 {
+            idx.add(i, &[i as f32 * 0.5, (i as f32 * 0.3).sin()]).unwrap();
+        }
+        assert_eq!(idx.len(), 200);
+        // The entry point should be the node with the highest level
+        let ep = idx.graph.entry_point.unwrap();
+        let ep_level = idx.graph.levels[ep as usize];
+        let max_level = idx.graph.levels.iter().enumerate()
+            .filter(|(i, _)| idx.graph.alive[*i])
+            .map(|(_, &l)| l)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(ep_level, max_level, "entry point should be at the highest level");
+    }
+
+    // ── add_batch_raw edge cases ──────────────────────────────────────
+
+    #[test]
+    fn add_batch_raw_basic_correctness() {
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 30, m: 8 };
+        let mut idx = HnswIndex::new(3, Metric::L2, cfg);
+        // 10 vectors of dim 3
+        let data: Vec<f32> = (0..30).map(|i| i as f32).collect();
+        idx.add_batch_raw(&data, 3, 0).unwrap();
+        assert_eq!(idx.len(), 10);
+        // Vector 0 is [0,1,2], vector 1 is [3,4,5], etc.
+        let r = idx.search(&[0.0, 1.0, 2.0], 1).unwrap();
+        assert_eq!(r[0].id, 0);
+    }
+
+    #[test]
+    fn add_batch_raw_with_start_id() {
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 30, m: 8 };
+        let mut idx = HnswIndex::new(2, Metric::L2, cfg);
+        let data = vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        idx.add_batch_raw(&data, 2, 100).unwrap();
+        assert_eq!(idx.len(), 3);
+        // IDs should be 100, 101, 102
+        let r = idx.search(&[1.0, 0.0], 1).unwrap();
+        assert_eq!(r[0].id, 100);
+    }
+
+    // ── Graph reserve ─────────────────────────────────────────────────
+
+    #[test]
+    fn graph_reserve_does_not_change_len() {
+        let mut graph = HnswGraph::new(4, 8, 100);
+        assert_eq!(graph.count, 0);
+        graph.reserve(100);
+        // Reserve should only affect capacity, not length/count
+        assert_eq!(graph.count, 0);
+        assert_eq!(graph.alive.len(), 0);
+    }
+
+    // ── HnswConfig default ───────────────────────────────────────────
+
+    #[test]
+    fn hnsw_config_default_values() {
+        let cfg = HnswConfig::default();
+        assert_eq!(cfg.ef_construction, 200);
+        assert_eq!(cfg.ef_search, 50);
+        assert_eq!(cfg.m, 12);
+    }
+
+    // ── Candidate ordering ───────────────────────────────────────────
+
+    #[test]
+    fn candidate_ordering() {
+        let c1 = Candidate { distance: 1.0, id: 0 };
+        let c2 = Candidate { distance: 2.0, id: 0 };
+        let c3 = Candidate { distance: 1.0, id: 1 };
+        assert!(c1 < c2);
+        assert!(c1 < c3); // same distance, lower id comes first
+        assert_eq!(c1.partial_cmp(&c2), Some(Ordering::Less));
+    }
+
+    #[test]
+    fn candidate_eq() {
+        let c1 = Candidate { distance: 1.5, id: 42 };
+        let c2 = Candidate { distance: 1.5, id: 42 };
+        assert!(c1 == c2);
+        assert!(c1.cmp(&c2) == Ordering::Equal);
+    }
+
+    // ── Graph get_neighbors upper layer empty ────────────────────────
+
+    #[test]
+    fn get_neighbors_upper_layer_no_upper_neighbors() {
+        let mut graph = HnswGraph::new(2, 4, 100);
+        graph.ensure_capacity(5);
+        graph.alive[0] = true;
+        graph.levels[0] = 0; // level 0 only
+        // Querying upper layer should return empty slice
+        let nbs = graph.get_neighbors(0, 1);
+        assert!(nbs.is_empty());
+        let nbs = graph.get_neighbors(0, 5);
+        assert!(nbs.is_empty());
+    }
+
+    // ── from_snapshot with upper layers ──────────────────────────────
+
+    #[test]
+    fn graph_from_snapshot_with_upper_layers() {
+        let mut nodes = HashMap::new();
+        nodes.insert(0u64, HnswNodeSnapshot {
+            vector: vec![1.0, 2.0],
+            neighbors: vec![
+                vec![1],       // layer 0 neighbors
+                vec![1],       // layer 1 neighbors
+            ],
+            level: 1,
+        });
+        nodes.insert(1u64, HnswNodeSnapshot {
+            vector: vec![3.0, 4.0],
+            neighbors: vec![
+                vec![0],       // layer 0 neighbors
+                vec![0],       // layer 1 neighbors
+            ],
+            level: 1,
+        });
+        let snap = HnswGraphSnapshot {
+            nodes,
+            entry_point: Some(0),
+            m: 4,
+            m_max0: 8,
+            ef_construction: 100,
+            ml: 1.0 / (4.0f64).ln(),
+        };
+        let graph = HnswGraph::from_snapshot(snap, 2);
+        assert_eq!(graph.count, 2);
+        assert_eq!(graph.entry_point, Some(0));
+        // Layer 0 neighbors
+        let nbs0 = graph.get_neighbors(0, 0);
+        assert_eq!(nbs0, &[1]);
+        // Upper layer neighbors: snapshot neighbors[1] = [1] → upper_neighbors[0][0] = [1]
+        let nbs1 = graph.get_neighbors(0, 1);
+        assert_eq!(nbs1, &[1]);
+    }
+
+    // ── to_snapshot and from_snapshot round trip ─────────────────────
+
+    #[test]
+    fn graph_snapshot_round_trip_with_upper_layers() {
+        // Build a graph with m=2 to get multi-level nodes, then snapshot + restore
+        let cfg = HnswConfig { ef_construction: 50, ef_search: 20, m: 2 };
+        let mut idx = HnswIndex::new(4, Metric::L2, cfg);
+        let mut rng = rand::thread_rng();
+        for i in 0..100u64 {
+            let v: Vec<f32> = (0..4).map(|_| rng.gen::<f32>() * 10.0).collect();
+            idx.add(i, &v).unwrap();
+        }
+        let snap = idx.graph.to_snapshot();
+        let restored = HnswGraph::from_snapshot(snap, 4);
+        assert_eq!(restored.count, idx.graph.count);
+        assert_eq!(restored.entry_point, idx.graph.entry_point);
+        // Verify vectors match
+        for i in 0..100u32 {
+            assert_eq!(restored.vector(i), idx.graph.vector(i));
+        }
+    }
+
+    // ── Delete edge cases ─────────────────────────────────────────────
+
+    #[test]
+    fn delete_upper_layer_node_cleans_back_edges() {
+        // Build with m=2 to get upper layer nodes, then delete one
+        let cfg = HnswConfig { ef_construction: 50, ef_search: 20, m: 2 };
+        let mut idx = HnswIndex::new(3, Metric::L2, cfg);
+        for i in 0..100u64 {
+            idx.add(i, &[i as f32, 0.0, 0.0]).unwrap();
+        }
+        // Find a node with upper layers
+        let upper_node = (0..100u32).find(|&i| {
+            idx.graph.alive[i as usize] && idx.graph.levels[i as usize] > 0
+        });
+        if let Some(node) = upper_node {
+            let level_before = idx.graph.levels[node as usize];
+            assert!(level_before > 0);
+            idx.delete(node as u64);
+            assert!(!idx.graph.is_alive(node));
+            // Upper neighbors should be cleared
+            assert!(idx.graph.upper_neighbors[node as usize].is_empty());
+        }
+    }
+
+    // ── Parallel insert followed by sequential add ───────────────────
+
+    #[test]
+    fn parallel_then_sequential_insert() {
+        let dim = 4;
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 30, m: 8 };
+        let mut idx = HnswIndex::new(dim, Metric::L2, cfg);
+        // First: parallel insert 50 vectors
+        let mut data = vec![0.0f32; 50 * dim];
+        let mut rng = rand::thread_rng();
+        for v in data.iter_mut() {
+            *v = rng.gen::<f32>() * 10.0;
+        }
+        idx.add_batch_parallel(&data, dim, 0, 2, 10).unwrap();
+        assert_eq!(idx.len(), 50);
+        // Then: sequential insert 10 more
+        for i in 50..60u64 {
+            let v: Vec<f32> = (0..dim).map(|_| rng.gen::<f32>() * 10.0).collect();
+            idx.add(i, &v).unwrap();
+        }
+        assert_eq!(idx.len(), 60);
+        // Search should work across all vectors
+        let r = idx.search(&data[0..dim], 1).unwrap();
+        assert_eq!(r.len(), 1);
+    }
+
+    // ── Instrumented insert followed by normal insert ────────────────
+
+    #[test]
+    fn instrumented_then_normal_insert() {
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 20, m: 8 };
+        let mut idx = HnswIndex::new(3, Metric::L2, cfg);
+        let entries: Vec<(u64, Vec<f32>)> = (0..20u64)
+            .map(|i| (i, vec![i as f32, 0.0, 0.0]))
+            .collect();
+        idx.add_batch_instrumented(&entries);
+        assert_eq!(idx.len(), 20);
+        // Now add more via normal path
+        for i in 20..30u64 {
+            idx.add(i, &[i as f32, 0.0, 0.0]).unwrap();
+        }
+        assert_eq!(idx.len(), 30);
+        let r = idx.search(&[25.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(r[0].id, 25);
+    }
+
+    // ── Parallel insert: multiple micro-batches with remainder ───────
+
+    #[test]
+    fn parallel_insert_remainder_micro_batch() {
+        // n=25, micro_batch_size=10: bootstrap=10, then batch [10..20], then batch [20..25]
+        // The last batch has only 5 vectors (< micro_batch_size)
+        let dim = 4;
+        let n = 25;
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 20, m: 8 };
+        let mut idx = HnswIndex::new(dim, Metric::L2, cfg);
+        let mut data = vec![0.0f32; n * dim];
+        let mut rng = rand::thread_rng();
+        for v in data.iter_mut() {
+            *v = rng.gen::<f32>() * 10.0;
+        }
+        idx.add_batch_parallel(&data, dim, 0, 2, 10).unwrap();
+        assert_eq!(idx.len(), n);
+    }
+
+    // ── InsertStats default ──────────────────────────────────────────
+
+    #[test]
+    fn insert_stats_default_all_zero() {
+        let stats = InsertStats::default();
+        assert_eq!(stats.random_level.as_nanos(), 0);
+        assert_eq!(stats.clone_vec.as_nanos(), 0);
+        assert_eq!(stats.node_insert.as_nanos(), 0);
+        assert_eq!(stats.greedy_descent.as_nanos(), 0);
+        assert_eq!(stats.search_layer.as_nanos(), 0);
+        assert_eq!(stats.sl_distance.as_nanos(), 0);
+        assert_eq!(stats.sl_hash_lookup.as_nanos(), 0);
+        assert_eq!(stats.sl_heap_ops.as_nanos(), 0);
+        assert_eq!(stats.set_neighbors.as_nanos(), 0);
+        assert_eq!(stats.back_edges.as_nanos(), 0);
+        assert_eq!(stats.pruning.as_nanos(), 0);
+    }
+
+    // ── Parallel insert: verify entry_point update in Phase C ────────
+
+    #[test]
+    fn parallel_insert_entry_point_at_max_level() {
+        // With m=2, parallel insert should update entry point to highest level node
+        let dim = 4;
+        let n = 200;
+        let cfg = HnswConfig { ef_construction: 50, ef_search: 20, m: 2 };
+        let mut idx = HnswIndex::new(dim, Metric::L2, cfg);
+        let mut data = vec![0.0f32; n * dim];
+        let mut rng = rand::thread_rng();
+        for v in data.iter_mut() {
+            *v = rng.gen::<f32>() * 50.0;
+        }
+        idx.add_batch_parallel(&data, dim, 0, 4, 20).unwrap();
+        assert_eq!(idx.len(), n);
+
+        // Entry point should be at max level
+        if let Some(ep) = idx.graph.entry_point {
+            let ep_level = idx.graph.levels[ep as usize];
+            let max_level = idx.graph.levels.iter().enumerate()
+                .filter(|(i, _)| idx.graph.alive[*i])
+                .map(|(_, &l)| l)
+                .max()
+                .unwrap_or(0);
+            assert_eq!(ep_level, max_level);
+        }
+    }
+
+    // ── add_batch dimension mismatch ─────────────────────────────────
+
+    #[test]
+    fn add_batch_wrong_dimension() {
+        let cfg = HnswConfig::default();
+        let mut idx = HnswIndex::new(3, Metric::L2, cfg);
+        let entries = vec![(0u64, vec![1.0, 2.0])]; // dim=2, index expects 3
+        let result = idx.add_batch(&entries);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn add_wrong_dimension() {
+        let cfg = HnswConfig::default();
+        let mut idx = HnswIndex::new(3, Metric::L2, cfg);
+        let result = idx.add(0, &[1.0, 2.0]); // dim=2, index expects 3
+        assert!(result.is_err());
+    }
+
+    // ── Instrumented + parallel combined ─────────────────────────────
+
+    #[test]
+    fn instrumented_insert_sparse_ids() {
+        let cfg = HnswConfig { ef_construction: 50, ef_search: 20, m: 4 };
+        let mut idx = HnswIndex::new(2, Metric::L2, cfg);
+        // Use sparse IDs to test ensure_capacity in instrumented path
+        let entries: Vec<(u64, Vec<f32>)> = vec![
+            (0, vec![0.0, 0.0]),
+            (10, vec![1.0, 0.0]),
+            (100, vec![2.0, 0.0]),
+            (500, vec![3.0, 0.0]),
+            (1000, vec![4.0, 0.0]),
+        ];
+        let stats = idx.add_batch_instrumented(&entries);
+        assert_eq!(idx.len(), 5);
+        assert!(stats.node_insert.as_nanos() > 0);
+        let r = idx.search(&[2.0, 0.0], 1).unwrap();
+        assert_eq!(r[0].id, 100);
+    }
+
+    // ── Graph layer0_stride ─────────────────────────────────────────
+
+    #[test]
+    fn layer0_stride_is_m_max0_plus_1() {
+        let graph = HnswGraph::new(4, 8, 100); // m=8, m_max0=16
+        assert_eq!(graph.layer0_stride(), 17); // m_max0 + 1
+    }
+
+    // ── Graph is_alive out of bounds ────────────────────────────────
+
+    #[test]
+    fn is_alive_out_of_bounds_returns_false() {
+        let graph = HnswGraph::new(4, 8, 100);
+        assert!(!graph.is_alive(999)); // no capacity allocated
+    }
+
+    // ── Graph max_level with no entry point ──────────────────────────
+
+    #[test]
+    fn max_level_no_entry_point() {
+        let graph = HnswGraph::new(4, 8, 100);
+        assert_eq!(graph.max_level(), 0);
+    }
+
+    // ── Flush is noop ────────────────────────────────────────────────
+
+    #[test]
+    fn flush_is_noop() {
+        let mut idx = make_index();
+        let count_before = idx.len();
+        idx.flush();
+        assert_eq!(idx.len(), count_before);
+    }
+
+    // ── VectorIndex trait methods ────────────────────────────────────
+
+    #[test]
+    fn vector_index_save_load_graph_trait() {
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 20, m: 8 };
+        let mut idx = HnswIndex::new(3, Metric::L2, cfg.clone());
+        for i in 0..10u64 {
+            idx.add(i, &[i as f32, 0.0, 0.0]).unwrap();
+        }
+        let path = std::path::Path::new("/tmp/hnsw_trait_graph_test.bin");
+        // Use trait method
+        VectorIndex::save_graph(&idx, path).unwrap();
+        let mut idx2 = HnswIndex::new(3, Metric::L2, cfg);
+        VectorIndex::load_graph_mmap(&mut idx2, path).unwrap();
+        assert_eq!(idx2.len(), 10);
     }
 }

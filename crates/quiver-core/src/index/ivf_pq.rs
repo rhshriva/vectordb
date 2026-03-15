@@ -624,4 +624,325 @@ mod tests {
             }
         ));
     }
+
+    // ── Additional coverage tests ─────────────────────────────────────────────
+
+    #[test]
+    fn search_dimension_mismatch() {
+        let idx = IvfPqIndex::new(4, Metric::L2, make_config());
+        let err = idx.search(&[1.0, 2.0], 1).unwrap_err();
+        assert!(matches!(err, VectorDbError::DimensionMismatch { expected: 4, got: 2 }));
+    }
+
+    #[test]
+    fn search_k_zero_returns_empty() {
+        let mut idx = IvfPqIndex::new(4, Metric::L2, IvfPqConfig {
+            train_size: 100,
+            ..make_config()
+        });
+        idx.add(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        let r = idx.search(&[1.0, 0.0, 0.0, 0.0], 0).unwrap();
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn search_k_greater_than_len() {
+        let mut idx = IvfPqIndex::new(4, Metric::L2, IvfPqConfig {
+            train_size: 100,
+            ..make_config()
+        });
+        idx.add(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.add(2, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        let r = idx.search(&[1.0, 0.0, 0.0, 0.0], 10).unwrap();
+        assert_eq!(r.len(), 2);
+    }
+
+    #[test]
+    fn search_empty_index() {
+        let idx = IvfPqIndex::new(4, Metric::L2, make_config());
+        let r = idx.search(&[1.0, 0.0, 0.0, 0.0], 5).unwrap();
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn add_batch_raw_happy_path() {
+        let mut idx = IvfPqIndex::new(4, Metric::L2, IvfPqConfig {
+            train_size: 100,
+            ..make_config()
+        });
+        let data = vec![
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            2.0, 0.0, 0.0, 0.0,
+        ];
+        idx.add_batch_raw(&data, 4, 10).unwrap();
+        assert_eq!(idx.len(), 3);
+        let r = idx.search(&[2.0, 0.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(r[0].id, 12);
+    }
+
+    #[test]
+    fn add_batch_raw_dimension_mismatch() {
+        let mut idx = IvfPqIndex::new(4, Metric::L2, make_config());
+        let data = vec![1.0, 0.0];
+        let err = idx.add_batch_raw(&data, 2, 0).unwrap_err();
+        assert!(matches!(err, VectorDbError::DimensionMismatch { expected: 4, got: 2 }));
+    }
+
+    #[test]
+    fn add_batch_raw_not_multiple_of_dim() {
+        let mut idx = IvfPqIndex::new(4, Metric::L2, make_config());
+        let data = vec![1.0, 0.0, 0.0]; // 3 elements, not multiple of 4
+        let err = idx.add_batch_raw(&data, 4, 0).unwrap_err();
+        assert!(matches!(err, VectorDbError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn add_batch_raw_triggers_training() {
+        let cfg = IvfPqConfig {
+            n_lists: 2,
+            nprobe: 2,
+            train_size: 4,
+            max_iter: 10,
+            pq: PqConfig { m: 2, k_sub: 4, max_iter: 10 },
+        };
+        let mut idx = IvfPqIndex::new(4, Metric::L2, cfg);
+        let data: Vec<f32> = (0..16).map(|i| {
+            if i % 4 == 0 { (i / 4) as f32 } else { 0.0 }
+        }).collect();
+        idx.add_batch_raw(&data, 4, 0).unwrap();
+        assert!(idx.trained);
+        assert_eq!(idx.len(), 4);
+    }
+
+    #[test]
+    fn add_batch_raw_empty_buffer() {
+        let mut idx = IvfPqIndex::new(4, Metric::L2, make_config());
+        idx.add_batch_raw(&[], 4, 0).unwrap();
+        assert_eq!(idx.len(), 0);
+    }
+
+    #[test]
+    fn delete_nonexistent_from_trained_index() {
+        let mut idx = make_trained(16);
+        assert!(!idx.delete(999));
+    }
+
+    #[test]
+    fn cosine_metric_search() {
+        let cfg = IvfPqConfig {
+            n_lists: 2,
+            nprobe: 2,
+            train_size: 8,
+            max_iter: 10,
+            pq: PqConfig { m: 2, k_sub: 4, max_iter: 10 },
+        };
+        let mut idx = IvfPqIndex::new(4, Metric::Cosine, cfg);
+        for i in 0..8u64 {
+            let v = i as f32 + 1.0;
+            idx.add(i, &[v, v, v, v]).unwrap();
+        }
+        // All vectors point in the same direction; PQ adds quantization error
+        // so we just verify a result is returned and results are ordered
+        let r = idx.search(&[1.0, 1.0, 1.0, 1.0], 3).unwrap();
+        assert!(!r.is_empty());
+        for w in r.windows(2) {
+            assert!(w[0].distance <= w[1].distance + 1e-3);
+        }
+    }
+
+    #[test]
+    fn dot_product_metric_search() {
+        let cfg = IvfPqConfig {
+            n_lists: 2,
+            nprobe: 2,
+            train_size: 8,
+            max_iter: 10,
+            pq: PqConfig { m: 2, k_sub: 4, max_iter: 10 },
+        };
+        let mut idx = IvfPqIndex::new(4, Metric::DotProduct, cfg);
+        for i in 0..8u64 {
+            idx.add(i, &[i as f32, 0.0, 0.0, 0.0]).unwrap();
+        }
+        let r = idx.search(&[1.0, 0.0, 0.0, 0.0], 3).unwrap();
+        assert_eq!(r.len(), 3);
+        for w in r.windows(2) {
+            assert!(w[0].distance <= w[1].distance + 1e-3);
+        }
+    }
+
+    #[test]
+    fn flush_on_already_trained_is_noop() {
+        let mut idx = make_trained(16);
+        assert!(idx.trained);
+        let len_before = idx.len();
+        idx.flush();
+        assert_eq!(idx.len(), len_before);
+    }
+
+    #[test]
+    fn flush_on_empty_staging_is_noop() {
+        let idx_cfg = IvfPqConfig { train_size: 100, ..make_config() };
+        let mut idx = IvfPqIndex::new(4, Metric::L2, idx_cfg);
+        assert!(!idx.trained);
+        idx.flush();
+        assert!(!idx.trained);
+    }
+
+    #[test]
+    fn iter_vectors_untrained() {
+        let mut idx = IvfPqIndex::new(4, Metric::L2, IvfPqConfig {
+            train_size: 100,
+            ..make_config()
+        });
+        idx.add(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.add(2, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        let mut ids: Vec<u64> = idx.iter_vectors().map(|(id, _)| id).collect();
+        ids.sort();
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn save_load_untrained() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ivfpq_untrained.bin");
+        let mut idx = IvfPqIndex::new(4, Metric::L2, IvfPqConfig {
+            train_size: 100,
+            ..make_config()
+        });
+        idx.add(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.add(2, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        idx.save(&path).unwrap();
+        let loaded = IvfPqIndex::load(&path).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert!(!loaded.trained);
+        let r = loaded.search(&[1.0, 0.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(r[0].id, 1);
+    }
+
+    #[test]
+    fn load_nonexistent_file_errors() {
+        let result = IvfPqIndex::load("/tmp/nonexistent_ivfpq_test_file.bin");
+        assert!(matches!(result, Err(VectorDbError::Io(_))));
+    }
+
+    #[test]
+    fn nprobe_clamped_to_centroids_len() {
+        let cfg = IvfPqConfig {
+            n_lists: 2,
+            nprobe: 100, // much larger than n_lists
+            train_size: 8,
+            max_iter: 10,
+            pq: PqConfig { m: 2, k_sub: 4, max_iter: 10 },
+        };
+        let mut idx = IvfPqIndex::new(4, Metric::L2, cfg);
+        for i in 0..8u64 {
+            idx.add(i, &[i as f32, 0.0, 0.0, 0.0]).unwrap();
+        }
+        let r = idx.search(&[3.0, 0.0, 0.0, 0.0], 3).unwrap();
+        assert_eq!(r.len(), 3);
+    }
+
+    #[test]
+    fn config_returns_correct_values() {
+        let idx = IvfPqIndex::new(8, Metric::Cosine, make_config());
+        assert_eq!(idx.config().dimensions, 8);
+        assert_eq!(idx.config().metric, Metric::Cosine);
+    }
+
+    #[test]
+    fn len_counts_staging_and_posting_lists() {
+        let cfg = IvfPqConfig {
+            n_lists: 2,
+            nprobe: 2,
+            train_size: 4,
+            max_iter: 10,
+            pq: PqConfig { m: 2, k_sub: 4, max_iter: 10 },
+        };
+        let mut idx = IvfPqIndex::new(4, Metric::L2, cfg);
+        assert_eq!(idx.len(), 0);
+        idx.add(0, &[0.0, 0.0, 0.0, 0.0]).unwrap();
+        assert_eq!(idx.len(), 1);
+        idx.add(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        assert_eq!(idx.len(), 2);
+        idx.add(2, &[2.0, 0.0, 0.0, 0.0]).unwrap();
+        assert_eq!(idx.len(), 3);
+        idx.add(3, &[3.0, 0.0, 0.0, 0.0]).unwrap();
+        assert!(idx.trained);
+        assert_eq!(idx.len(), 4);
+    }
+
+    #[test]
+    fn kmeans_with_fewer_vectors_than_lists() {
+        let cfg = IvfPqConfig {
+            n_lists: 4,
+            nprobe: 4,
+            train_size: 2,
+            max_iter: 5,
+            pq: PqConfig { m: 2, k_sub: 2, max_iter: 5 },
+        };
+        let mut idx = IvfPqIndex::new(4, Metric::L2, cfg);
+        idx.add(0, &[0.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.add(1, &[10.0, 0.0, 0.0, 0.0]).unwrap();
+        assert!(idx.trained);
+        assert!(idx.centroids.len() <= 2);
+    }
+
+    #[test]
+    fn delete_all_from_posting_list() {
+        let mut idx = make_trained(16);
+        for i in 0..16u64 {
+            assert!(idx.delete(i));
+        }
+        assert_eq!(idx.len(), 0);
+        let r = idx.search(&[5.0, 0.0, 0.0, 0.0], 5).unwrap();
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn delete_from_staging_removes_original() {
+        let mut idx = IvfPqIndex::new(4, Metric::L2, IvfPqConfig {
+            train_size: 100,
+            ..make_config()
+        });
+        idx.add(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        assert!(idx.delete(1));
+        // Verify iter_vectors is also empty (originals cleaned up)
+        assert_eq!(idx.iter_vectors().count(), 0);
+    }
+
+    #[test]
+    fn iter_vectors_after_delete() {
+        let mut idx = make_trained(16);
+        idx.delete(5);
+        idx.delete(10);
+        let mut ids: Vec<u64> = idx.iter_vectors().map(|(id, _)| id).collect();
+        ids.sort();
+        let expected: Vec<u64> = (0..16).filter(|&i| i != 5 && i != 10).collect();
+        assert_eq!(ids, expected);
+    }
+
+    #[test]
+    fn save_load_preserves_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ivfpq_cfg.bin");
+        let cfg = IvfPqConfig {
+            n_lists: 3,
+            nprobe: 2,
+            train_size: 8,
+            max_iter: 7,
+            pq: PqConfig { m: 2, k_sub: 4, max_iter: 10 },
+        };
+        let mut idx = IvfPqIndex::new(4, Metric::Cosine, cfg);
+        for i in 0..8u64 {
+            let v = i as f32 + 1.0;
+            idx.add(i, &[v, v, 0.0, 0.0]).unwrap();
+        }
+        idx.save(&path).unwrap();
+        let loaded = IvfPqIndex::load(&path).unwrap();
+        assert_eq!(loaded.config().dimensions, 4);
+        assert_eq!(loaded.config().metric, Metric::Cosine);
+        assert_eq!(loaded.len(), 8);
+        assert!(loaded.trained);
+    }
 }
