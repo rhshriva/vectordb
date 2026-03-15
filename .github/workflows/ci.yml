@@ -25,29 +25,3 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
-
-  python:
-    name: Python wheel build
-    runs-on: ubuntu-latest
-    needs: rust
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install maturin
-        run: pip install maturin
-
-      - name: Build wheel
-        run: maturin build --release -m crates/quiver-python/Cargo.toml
-
-      - name: Install and verify
-        run: |
-          pip install target/wheels/quiver_vector_db-*.whl
-          python -c "import quiver_vector_db; print('OK:', dir(quiver_vector_db))"

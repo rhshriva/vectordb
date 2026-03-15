@@ -6,7 +6,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.4"
 edition = "2021"
 authors = ["Quiver contributors"]
 license = "Apache-2.0"
@@ -33,7 +33,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 rand = "0.8"
 
 # Python bindings
-pyo3 = { version = "0.22", features = ["extension-module", "abi3-py311"] }
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py311", "generate-import-lib"] }
 tempfile = "3"
 
 # Binary serialization for index snapshots and WAL
@@ -51,6 +51,9 @@ rayon = "1.10"
 # FAISS bindings (optional; requires libfaiss_c to be installed or use features=["static"])
 # NOTE: optional = true must live in the crate-level Cargo.toml, not here.
 faiss = "0.13"
+
+# Pure-Rust GEMM (matrix multiply) — BLIS-style micro-kernels with AVX/NEON
+matrixmultiply = "0.3"
 
 [profile.release]
 opt-level = 3

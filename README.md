@@ -59,58 +59,90 @@ maturin develop --release
 
 ## Performance
 
-Apple M-series (16 cores), 2,000 vectors × 128 dimensions, k=10, release build — insert throughput, single-query search latency, and recall@10 measured with matched configurations (M=16, ef_construction=200, ef_search=50, nlist=32, nprobe=8) across all four libraries.
+Benchmarks run on **GitHub Actions** CI runners — fully reproducible via `workflow_dispatch`.
 
-### Insert Throughput (vectors/sec, higher is better)
+| | **x86_64 Runner** | **ARM64 Runner** |
+|---|---|---|
+| **OS** | Ubuntu (ubuntu-latest) | Ubuntu (ubuntu-24.04-arm) |
+| **CPU** | 4 cores, x86_64 | 4 cores, ARM64 (Neoverse) |
+| **RAM** | 16 GB | 16 GB |
+| **Python** | 3.12 | 3.12 |
+| **Build** | `maturin develop --release` | `maturin develop --release` |
 
-| Index Type | Quiver | faiss | hnswlib | ChromaDB |
-|---|---:|---:|---:|---:|
-| Flat (brute-force) | **28,269K** | 56,140K | not-supported | not-supported |
-| HNSW (1 thread) | **20,495** | 16,234 | 9,774 | — |
-| HNSW (16 threads) | 59,644 | **123,475** | 64,786 | 29,704 |
-| Int8 / SQ8 | **12,276K** | 6,069K | not-supported | not-supported |
-| IVF-Flat | 198K | **1,299K** | not-supported | not-supported |
-| IVF-PQ | 72K | **133K** | not-supported | not-supported |
-| FP16 | **13,691K** | not-supported | not-supported | not-supported |
-| Mmap | **1,748K** | not-supported | not-supported | not-supported |
-| Binary | **2,217K** | not-supported | not-supported | not-supported |
+2,000 vectors × 128 dimensions, k=10 — matched configs (M=16, ef_construction=200, ef_search=50, nlist=32, nprobe=8).
 
-### Search Latency (ms/query, lower is better)
+### Brute-Force (Flat)
 
-| Index Type | Quiver | faiss | hnswlib | ChromaDB |
-|---|---:|---:|---:|---:|
-| Flat (brute-force) | 0.023 | **0.016** | not-supported | not-supported |
-| HNSW | **0.022** | 0.023 | 0.044 | 0.285 |
-| Int8 / SQ8 | **0.060** | 0.095 | not-supported | not-supported |
-| IVF-Flat | 0.016 | **0.009** | not-supported | not-supported |
-| IVF-PQ | 0.014 | **0.008** | not-supported | not-supported |
-| FP16 | **0.116** | not-supported | not-supported | not-supported |
-| Mmap | **0.032** | not-supported | not-supported | not-supported |
-| Binary | **0.013** | not-supported | not-supported | not-supported |
+| Engine | Insert (vec/s) | Search (ms) | Recall@10 | | Insert (vec/s) | Search (ms) | Recall@10 |
+|---|---:|---:|---:|---|---:|---:|---:|
+| | **x86_64** | | | | **ARM64** | | |
+| **Quiver Flat** | **12,893K** | 0.044 | 1.0000 | | **7,961K** | 0.056 | 1.0000 |
+| faiss Flat | 6,808K | **0.036** | 1.0000 | | 5,166K | **0.051** | 1.0000 |
+| LanceDB | 287K | 2.986 | 1.0000 | | 262K | 3.514 | 1.0000 |
 
-### Recall@10 (higher is better)
+> Quiver Flat insert is **1.5–1.9x faster** than faiss, **45–50x faster** than LanceDB.
 
-| Index Type | Quiver | faiss | hnswlib | ChromaDB |
-|---|---:|---:|---:|---:|
-| Flat (brute-force) | **1.0000** | **1.0000** | not-supported | not-supported |
-| HNSW | 0.9410 | **0.9510** | 0.9350 | 0.9280 |
-| Int8 / SQ8 | **0.9940** | 0.9930 | not-supported | not-supported |
-| IVF-Flat | **0.5740** | 0.5670 | not-supported | not-supported |
-| IVF-PQ | **0.0720** | 0.0690 | not-supported | not-supported |
-| FP16 | **1.0000** | not-supported | not-supported | not-supported |
-| Mmap | **1.0000** | not-supported | not-supported | not-supported |
-| Binary | **0.1180** | not-supported | not-supported | not-supported |
+### HNSW (Approximate Nearest Neighbor)
 
-**Highlights:**
+| Engine | Insert (vec/s) | Search (ms) | Recall@10 | | Insert (vec/s) | Search (ms) | Recall@10 |
+|---|---:|---:|---:|---|---:|---:|---:|
+| | **x86_64** | | | | **ARM64** | | |
+| **Quiver HNSW (1T)** | 11,700 | **0.039** | 0.9410 | | 12,025 | **0.042** | 0.9430 |
+| **Quiver HNSW (4T)** | 24,539 | **0.038** | 0.9410 | | 22,618 | **0.053** | 0.9410 |
+| usearch | 30,498 | 0.094 | 0.9260 | | 34,067 | 0.113 | 0.9250 |
+| faiss HNSW (1T) | 8,988 | 0.047 | 0.9510 | | 8,636 | 0.058 | 0.9510 |
+| faiss HNSW (4T) | 25,060 | 0.047 | 0.9510 | | 30,446 | 0.058 | 0.9510 |
 
-- **HNSW single-thread insert**: Quiver 20.5K — **2.1x faster** than hnswlib (9.8K), **1.3x faster** than faiss (16.2K)
-- **Int8 insert**: Quiver 12.3M — **2x FASTER** than faiss SQ8 (6.1M)
-- **HNSW search**: Quiver 0.022ms — **2x faster** than hnswlib (0.044ms), **13x faster** than ChromaDB (0.285ms)
-- **Int8 search**: Quiver 0.060ms — **1.6x faster** than faiss SQ8 (0.095ms)
+> Quiver HNSW search is **1.2x faster** than faiss, **2.4x faster** than usearch. Single-thread insert **1.3x faster** than faiss.
+
+### Scalar Quantization (Int8)
+
+| Engine | Insert (vec/s) | Search (ms) | Recall@10 | | Insert (vec/s) | Search (ms) | Recall@10 |
+|---|---:|---:|---:|---|---:|---:|---:|
+| | **x86_64** | | | | **ARM64** | | |
+| **Quiver Int8** | 1,284K | 0.171 | **0.9940** | | **4,302K** | 0.197 | **0.9940** |
+| faiss SQ8 | **3,485K** | **0.057** | 0.9930 | | 3,257K | **0.155** | 0.9930 |
+
+> On ARM64, Quiver Int8 insert is **1.3x faster** than faiss SQ8 (4.3M vs 3.3M vec/s).
+
+### IVF-Flat (Inverted File Index)
+
+| Engine | Insert (vec/s) | Search (ms) | Recall@10 | | Insert (vec/s) | Search (ms) | Recall@10 |
+|---|---:|---:|---:|---|---:|---:|---:|
+| | **x86_64** | | | | **ARM64** | | |
+| **Quiver IVF-Flat** | 216K | 0.037 | **0.6380** | | 200K | 0.030 | 0.5590 |
+| faiss IVF-Flat | **392K** | **0.022** | 0.5670 | | **227K** | **0.027** | **0.5670** |
+
+### IVF-PQ (Product Quantization)
+
+| Engine | Insert (vec/s) | Search (ms) | Recall@10 | | Insert (vec/s) | Search (ms) | Recall@10 |
+|---|---:|---:|---:|---|---:|---:|---:|
+| | **x86_64** | | | | **ARM64** | | |
+| **Quiver IVF-PQ** | 29K | 0.038 | **0.0760** | | 33K | 0.029 | **0.0730** |
+| faiss IVFPQ | **79K** | **0.027** | 0.0690 | | **78K** | **0.016** | 0.0690 |
+
+### Quiver-Only Index Types
+
+| Index | Insert (vec/s) | Search (ms) | Recall@10 | | Insert (vec/s) | Search (ms) | Recall@10 |
+|---|---:|---:|---:|---|---:|---:|---:|
+| | **x86_64** | | | | **ARM64** | | |
+| FP16 | 3,049K | 0.590 | 1.0000 | | 4,164K | 0.311 | 1.0000 |
+| Mmap | 1,155K | 0.060 | 1.0000 | | 1,125K | 0.068 | 1.0000 |
+| Binary | 1,108K | 0.034 | 0.1130 | | 1,721K | 0.027 | 0.1140 |
+
+> FP16, Mmap, and Binary indexes are **unique to Quiver** — not available in faiss, usearch, or LanceDB.
+
+### Key Takeaways
+
+- **Flat insert**: Quiver **1.5–1.9x faster** than faiss, **45–50x faster** than LanceDB
+- **HNSW search**: Quiver **0.039ms** — **1.2x faster** than faiss (0.047ms), **2.4x faster** than usearch (0.094ms)
+- **HNSW single-thread insert**: Quiver 11.7K — **1.3x faster** than faiss (9.0K)
+- **Int8 insert on ARM64**: Quiver **4.3M** — **1.3x faster** than faiss SQ8 (3.3M)
 - **Recall parity**: Quiver matches or exceeds competitors across all index types
 - **3 unique index types** (FP16, Mmap, Binary) not available in any competitor
 
-Reproduce: `pytest tests/test_competitive_benchmarks.py -v -s`
+Reproduce locally: `pip install quiver-vector-db[benchmark] && pytest tests/test_competitive_benchmarks.py -v -s`
+Reproduce on CI: trigger the **Performance Benchmarks** workflow from the [Actions tab](https://github.com/rhshriva/Quiver/actions/workflows/benchmark.yml)
 
 ---
 

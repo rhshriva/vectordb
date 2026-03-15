@@ -20,6 +20,7 @@ memmap2 = { workspace = true }
 half = { workspace = true }
 rayon = { workspace = true }
 faiss = { workspace = true, optional = true }
+matrixmultiply = { workspace = true }
 
 [dev-dependencies]
 approx = "0.5"

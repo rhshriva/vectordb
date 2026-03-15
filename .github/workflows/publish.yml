@@ -1,6 +1,7 @@
 name: Publish to PyPI
 
 on:
+  # Manual only: developer triggers from Actions tab
   workflow_dispatch:
     inputs:
       test_pypi:
@@ -12,11 +13,24 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test:
-    name: Run tests
+  # Guard: abort if not on main (workflow_dispatch can be triggered from any branch)
+  guard:
+    name: Verify branch is main
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Check branch
+        run: |
+          if [[ "${{ github.ref }}" != "refs/heads/main" && "${{ github.ref }}" != refs/tags/v* ]]; then
+            echo "::error::Publish workflow must run from main branch or a version tag. Current ref: ${{ github.ref }}"
+            exit 1
+          fi
+
+  test:
+    name: Run tests
+    needs: guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run Rust tests
@@ -29,32 +43,43 @@ jobs:
     strategy:
       matrix:
         include:
+          # Linux
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
+          # macOS
           - os: macos-latest
             target: aarch64-apple-darwin
           - os: macos-latest
             target: x86_64-apple-darwin
+          # Windows
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
-      - name: Install maturin and zig
-        run: pip install maturin ziglang
+      - name: Install maturin
+        run: pip install maturin
+
+      - name: Install ziglang (non-Windows only)
+        if: runner.os != 'Windows'
+        run: pip install ziglang
 
       - name: Build wheel
-        run: maturin build --release --zig -m crates/quiver-python/Cargo.toml --target ${{ matrix.target }}
+        run: maturin build --release ${{ runner.os != 'Windows' && '--zig' || '' }} -m crates/quiver-python/Cargo.toml --target ${{ matrix.target }}
 
       - name: Upload wheel artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: wheel-${{ matrix.target }}
           path: target/wheels/quiver_vector_db-*.whl
@@ -67,7 +92,7 @@ jobs:
       id-token: write
     steps:
       - name: Download all wheels
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           pattern: wheel-*
           merge-multiple: true

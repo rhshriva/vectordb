@@ -90,3 +90,94 @@ pub trait VectorIndex: Send + Sync {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::flat::FlatIndex;
+    use tempfile::tempdir;
+
+    #[test]
+    fn search_result_clone_and_eq() {
+        let r1 = SearchResult { id: 1, distance: 0.5 };
+        let r2 = r1.clone();
+        assert_eq!(r1, r2);
+        assert_eq!(r1.id, 1);
+        assert_eq!(r1.distance, 0.5);
+    }
+
+    #[test]
+    fn search_result_debug() {
+        let r = SearchResult { id: 42, distance: 1.23 };
+        let dbg = format!("{:?}", r);
+        assert!(dbg.contains("42"));
+    }
+
+    #[test]
+    fn index_config_debug_and_clone() {
+        let cfg = IndexConfig { dimensions: 3, metric: Metric::Cosine };
+        let cfg2 = cfg.clone();
+        assert_eq!(cfg.dimensions, cfg2.dimensions);
+        let _ = format!("{:?}", cfg);
+    }
+
+    #[test]
+    fn default_add_batch_delegates_to_add() {
+        let mut idx = FlatIndex::new(3, Metric::L2);
+        let entries = vec![
+            (1, vec![1.0, 0.0, 0.0]),
+            (2, vec![0.0, 1.0, 0.0]),
+            (3, vec![0.0, 0.0, 1.0]),
+        ];
+        idx.add_batch(&entries).unwrap();
+        assert_eq!(idx.len(), 3);
+    }
+
+    #[test]
+    fn is_empty_when_no_vectors() {
+        let idx = FlatIndex::new(3, Metric::L2);
+        assert!(idx.is_empty());
+    }
+
+    #[test]
+    fn is_empty_false_after_add() {
+        let mut idx = FlatIndex::new(3, Metric::L2);
+        idx.add(1, &[1.0, 0.0, 0.0]).unwrap();
+        assert!(!idx.is_empty());
+    }
+
+    #[test]
+    fn default_flush_is_noop() {
+        let mut idx = FlatIndex::new(3, Metric::L2);
+        idx.add(1, &[1.0, 0.0, 0.0]).unwrap();
+        idx.flush(); // should not panic or change state
+        assert_eq!(idx.len(), 1);
+    }
+
+    #[test]
+    fn default_save_graph_is_noop() {
+        let idx = FlatIndex::new(3, Metric::L2);
+        let dir = tempdir().unwrap();
+        let result = idx.save_graph(dir.path());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn default_load_graph_mmap_calls_flush() {
+        let mut idx = FlatIndex::new(3, Metric::L2);
+        idx.add(1, &[1.0, 0.0, 0.0]).unwrap();
+        let dir = tempdir().unwrap();
+        let result = idx.load_graph_mmap(dir.path());
+        assert!(result.is_ok());
+        // Index should still be intact after load_graph_mmap
+        assert_eq!(idx.len(), 1);
+    }
+
+    #[test]
+    fn config_returns_correct_values() {
+        let idx = FlatIndex::new(4, Metric::DotProduct);
+        let cfg = idx.config();
+        assert_eq!(cfg.dimensions, 4);
+        assert_eq!(cfg.metric, Metric::DotProduct);
+    }
+}
