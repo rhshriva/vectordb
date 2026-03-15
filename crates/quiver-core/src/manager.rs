@@ -170,4 +170,82 @@ mod tests {
         let deleted = mgr.delete_collection("ghost").unwrap();
         assert!(!deleted);
     }
+
+    // ── Additional coverage tests ────────────────────────────────────────────
+
+    #[test]
+    fn manager_get_collection_none_for_missing() {
+        let dir = tempdir().unwrap();
+        let mgr = CollectionManager::open(dir.path()).unwrap();
+        assert!(mgr.get_collection("nonexistent").is_none());
+    }
+
+    #[test]
+    fn manager_get_collection_mut_none_for_missing() {
+        let dir = tempdir().unwrap();
+        let mut mgr = CollectionManager::open(dir.path()).unwrap();
+        assert!(mgr.get_collection_mut("nonexistent").is_none());
+    }
+
+    #[test]
+    fn manager_skips_non_directory_entries() {
+        let dir = tempdir().unwrap();
+        // Create a regular file in the base path (should be ignored on open)
+        std::fs::write(dir.path().join("not_a_collection.txt"), "hello").unwrap();
+        let mgr = CollectionManager::open(dir.path()).unwrap();
+        assert_eq!(mgr.list_collections().len(), 0);
+    }
+
+    #[test]
+    fn manager_skips_dirs_without_meta_json() {
+        let dir = tempdir().unwrap();
+        // Create a subdirectory without meta.json (should be ignored)
+        std::fs::create_dir(dir.path().join("empty_dir")).unwrap();
+        let mgr = CollectionManager::open(dir.path()).unwrap();
+        assert_eq!(mgr.list_collections().len(), 0);
+    }
+
+    #[test]
+    fn manager_handles_corrupt_meta_json() {
+        let dir = tempdir().unwrap();
+        // Create a subdirectory with an invalid meta.json
+        let col_dir = dir.path().join("corrupt");
+        std::fs::create_dir(&col_dir).unwrap();
+        std::fs::write(col_dir.join("meta.json"), "not valid json!!!").unwrap();
+        // Should not panic, just warn and skip
+        let mgr = CollectionManager::open(dir.path()).unwrap();
+        assert_eq!(mgr.list_collections().len(), 0);
+    }
+
+    #[test]
+    fn manager_delete_collection_whose_dir_already_removed() {
+        let dir = tempdir().unwrap();
+        let mut mgr = CollectionManager::open(dir.path()).unwrap();
+        mgr.create_collection(make_meta("vanish")).unwrap();
+        // Manually remove the directory before calling delete_collection
+        let col_dir = dir.path().join("vanish");
+        std::fs::remove_dir_all(&col_dir).unwrap();
+        // delete_collection should still succeed (dir.exists() is false branch)
+        let deleted = mgr.delete_collection("vanish").unwrap();
+        assert!(deleted);
+    }
+
+    #[test]
+    fn manager_get_collection_returns_some() {
+        let dir = tempdir().unwrap();
+        let mut mgr = CollectionManager::open(dir.path()).unwrap();
+        mgr.create_collection(make_meta("found")).unwrap();
+        let col = mgr.get_collection("found");
+        assert!(col.is_some());
+        assert_eq!(col.unwrap().meta().name, "found");
+    }
+
+    #[test]
+    fn manager_get_collection_mut_returns_some() {
+        let dir = tempdir().unwrap();
+        let mut mgr = CollectionManager::open(dir.path()).unwrap();
+        mgr.create_collection(make_meta("mutable")).unwrap();
+        let col = mgr.get_collection_mut("mutable");
+        assert!(col.is_some());
+    }
 }

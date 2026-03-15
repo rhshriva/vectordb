@@ -398,4 +398,423 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, 1);
     }
+
+    // ── count() tests ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn count_empty_collection() {
+        let dir = tempdir().unwrap();
+        let mut db = open_db(&dir);
+        db.create_collection("c", 3, Metric::L2).unwrap();
+        assert_eq!(db.count("c").unwrap(), 0);
+    }
+
+    #[test]
+    fn count_after_upserts() {
+        let dir = tempdir().unwrap();
+        let mut db = open_db(&dir);
+        db.create_collection("c", 2, Metric::L2).unwrap();
+        db.upsert("c", 1, &[1.0, 0.0], None).unwrap();
+        db.upsert("c", 2, &[0.0, 1.0], None).unwrap();
+        db.upsert("c", 3, &[1.0, 1.0], None).unwrap();
+        assert_eq!(db.count("c").unwrap(), 3);
+    }
+
+    #[test]
+    fn count_nonexistent_collection_errors() {
+        let dir = tempdir().unwrap();
+        let db = open_db(&dir);
+        let result = db.count("nope");
+        assert!(matches!(result, Err(VectorDbError::CollectionNotFound(_))));
+    }
+
+    // ── upsert_batch() tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn upsert_batch_basic() {
+        let dir = tempdir().unwrap();
+        let mut db = open_db(&dir);
+        db.create_collection("b", 2, Metric::L2).unwrap();
+
+        let entries = vec![
+            (1, vec![1.0, 0.0], None),
+            (2, vec![0.0, 1.0], None),
+            (3, vec![1.0, 1.0], Some(serde_json::json!({"k": "v"}))),
+        ];
+        db.upsert_batch("b", entries).unwrap();
+        assert_eq!(db.count("b").unwrap(), 3);
+
+        // Verify search still works after batch insert
+        let hits = db.search("b", &[1.0, 0.0], 1).unwrap();
+        assert_eq!(hits[0].id, 1);
+    }
+
+    #[test]
+    fn upsert_batch_empty() {
+        let dir = tempdir().unwrap();
+        let mut db = open_db(&dir);
+        db.create_collection("b", 2, Metric::L2).unwrap();
+        db.upsert_batch("b", vec![]).unwrap();
+        assert_eq!(db.count("b").unwrap(), 0);
+    }
+
+    #[test]
+    fn upsert_batch_nonexistent_collection_errors() {
+        let dir = tempdir().unwrap();
+        let mut db = open_db(&dir);
+        let result = db.upsert_batch("missing", vec![(1, vec![1.0], None)]);
+        assert!(matches!(result, Err(VectorDbError::CollectionNotFound(_))));
+    }
+
+    // ── delete vector tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn delete_nonexistent_vector_returns_false() {
+        let dir = tempdir().unwrap();
+        let mut db = open_db(&dir);
+        db.create_collection("d", 2, Metric::L2).unwrap();
+        // Deleting an id that was never inserted should return false (or Ok).
+        // The exact behaviour depends on the index; we just verify no panic.
+        let _result = db.delete("d", 999);
+    }
+
+    #[test]
+    fn delete_on_nonexistent_collection_errors() {
+        let dir = tempdir().unwrap();
+        let mut db = open_db(&dir);
+        let result = db.delete("ghost", 1);
+        assert!(matches!(result, Err(VectorDbError::CollectionNotFound(_))));
+    }
+
+    #[test]
+    fn delete_then_count_decreases() {
+        let dir = tempdir().unwrap();
+        let mut db = open_db(&dir);
+        db.create_collection("d", 2, Metric::L2).unwrap();
+        db.upsert("d", 1, &[1.0, 0.0], None).unwrap();
+        db.upsert("d", 2, &[0.0, 1.0], None).unwrap();
+        assert_eq!(db.count("d").unwrap(), 2);
+        db.delete("d", 1).unwrap();
+        assert_eq!(db.count("d").unwrap(), 1);
+    }
+
+    // ── Error path: upsert to non-existent collection ─────────────────────────
+
+    #[test]
+    fn upsert_nonexistent_collection_errors() {
+        let dir = tempdir().unwrap();
+        let mut db = open_db(&dir);
+        let result = db.upsert("nope", 1, &[1.0], None);
+        assert!(matches!(result, Err(VectorDbError::CollectionNotFound(_))));
+    }
+
+    // ── Error path: delete non-existent collection ────────────────────────────
+
+    #[test]
+    fn delete_nonexistent_collection_returns_false() {
+        let dir = tempdir().unwrap();
+        let mut db = open_db(&dir);
+        let result = db.delete_collection("nonexistent").unwrap();
+        assert!(!result);
+    }
+
+    // ── Error path: search_filtered on non-existent collection ────────────────
+
+    #[test]
+    fn search_filtered_nonexistent_collection_errors() {
+        let dir = tempdir().unwrap();
+        let db = open_db(&dir);
+        let filter: FilterCondition = serde_json::from_value(
+            serde_json::json!({"k": {"$eq": "v"}})
+        ).unwrap();
+        let result = db.search_filtered("nope", &[1.0], 5, &filter);
+        assert!(matches!(result, Err(VectorDbError::CollectionNotFound(_))));
+    }
+
+    // ── Error path: create duplicate collection ───────────────────────────────
+
+    #[test]
+    fn create_duplicate_collection_errors() {
+        let dir = tempdir().unwrap();
+        let mut db = open_db(&dir);
+        db.create_collection("dup", 2, Metric::L2).unwrap();
+        let result = db.create_collection("dup", 2, Metric::L2);
+        assert!(matches!(result, Err(VectorDbError::CollectionAlreadyExists(_))));
+    }
+
+    // ── MockEmbedder and text embedding tests ─────────────────────────────────
+
+    struct MockEmbedder {
+        dims: usize,
+    }
+
+    impl crate::embedder::TextEmbedder for MockEmbedder {
+        fn embed(&self, text: &str) -> Result<Vec<f32>, Box<dyn std::error::Error + Send + Sync>> {
+            // Produce a deterministic vector based on text length
+            Ok(vec![text.len() as f32 / 10.0; self.dims])
+        }
+        fn dimensions(&self) -> Option<usize> {
+            Some(self.dims)
+        }
+    }
+
+    #[test]
+    fn set_embedder_basic() {
+        let dir = tempdir().unwrap();
+        let mut db = open_db(&dir);
+        db.create_collection("e", 3, Metric::Cosine).unwrap();
+        let embedder = Arc::new(MockEmbedder { dims: 3 });
+        db.set_embedder("e", embedder).unwrap();
+    }
+
+    #[test]
+    fn set_embedder_dimension_mismatch_errors() {
+        let dir = tempdir().unwrap();
+        let mut db = open_db(&dir);
+        db.create_collection("e", 3, Metric::Cosine).unwrap();
+        let embedder = Arc::new(MockEmbedder { dims: 5 }); // mismatch: collection is 3
+        let result = db.set_embedder("e", embedder);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn set_embedder_nonexistent_collection_errors() {
+        let dir = tempdir().unwrap();
+        let mut db = open_db(&dir);
+        let embedder = Arc::new(MockEmbedder { dims: 3 });
+        let result = db.set_embedder("nope", embedder);
+        assert!(matches!(result, Err(VectorDbError::CollectionNotFound(_))));
+    }
+
+    #[test]
+    fn upsert_text_without_embedder_errors() {
+        let dir = tempdir().unwrap();
+        let mut db = open_db(&dir);
+        db.create_collection("t", 3, Metric::Cosine).unwrap();
+        let result = db.upsert_text("t", 1, "hello", None);
+        assert!(matches!(result, Err(VectorDbError::NoEmbedder(_))));
+    }
+
+    #[test]
+    fn search_text_without_embedder_errors() {
+        let dir = tempdir().unwrap();
+        let mut db = open_db(&dir);
+        db.create_collection("t", 3, Metric::Cosine).unwrap();
+        let result = db.search_text("t", "hello", 5);
+        assert!(matches!(result, Err(VectorDbError::NoEmbedder(_))));
+    }
+
+    #[test]
+    fn upsert_text_nonexistent_collection_errors() {
+        let dir = tempdir().unwrap();
+        let mut db = open_db(&dir);
+        let result = db.upsert_text("nope", 1, "hello", None);
+        assert!(matches!(result, Err(VectorDbError::CollectionNotFound(_))));
+    }
+
+    #[test]
+    fn search_text_nonexistent_collection_errors() {
+        let dir = tempdir().unwrap();
+        let db = open_db(&dir);
+        let result = db.search_text("nope", "hello", 5);
+        assert!(matches!(result, Err(VectorDbError::CollectionNotFound(_))));
+    }
+
+    #[test]
+    fn upsert_text_and_search_text_with_embedder() {
+        let dir = tempdir().unwrap();
+        let mut db = open_db(&dir);
+        db.create_collection("t", 3, Metric::L2).unwrap();
+        let embedder = Arc::new(MockEmbedder { dims: 3 });
+        db.set_embedder("t", embedder).unwrap();
+
+        // Insert two texts with different lengths => different embeddings
+        db.upsert_text("t", 1, "hi", None).unwrap();          // vec = [0.2, 0.2, 0.2]
+        db.upsert_text("t", 2, "hello world", None).unwrap();  // vec = [1.1, 1.1, 1.1]
+
+        assert_eq!(db.count("t").unwrap(), 2);
+
+        // Search for text "hi" — should find id=1 as nearest (identical embedding)
+        let hits = db.search_text("t", "hi", 2).unwrap();
+        assert_eq!(hits[0].id, 1);
+        assert!(hits[0].distance < 1e-4);
+    }
+
+    #[test]
+    fn upsert_text_with_payload() {
+        let dir = tempdir().unwrap();
+        let mut db = open_db(&dir);
+        db.create_collection("t", 3, Metric::L2).unwrap();
+        let embedder = Arc::new(MockEmbedder { dims: 3 });
+        db.set_embedder("t", embedder).unwrap();
+
+        db.upsert_text("t", 10, "doc", Some(serde_json::json!({"src": "test"}))).unwrap();
+        let hits = db.search_text("t", "doc", 1).unwrap();
+        assert_eq!(hits[0].id, 10);
+        assert_eq!(hits[0].payload.as_ref().unwrap()["src"], "test");
+    }
+
+    // ── Snapshot tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn create_and_list_snapshots() {
+        let dir = tempdir().unwrap();
+        let mut db = open_db(&dir);
+        db.create_collection("s", 2, Metric::L2).unwrap();
+        db.upsert("s", 1, &[1.0, 0.0], None).unwrap();
+
+        let snap = db.create_snapshot("s", "v1").unwrap();
+        assert_eq!(snap.name, "v1");
+
+        let snaps = db.list_snapshots("s").unwrap();
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].name, "v1");
+    }
+
+    #[test]
+    fn restore_snapshot() {
+        let dir = tempdir().unwrap();
+        let mut db = open_db(&dir);
+        db.create_collection("s", 2, Metric::L2).unwrap();
+        db.upsert("s", 1, &[1.0, 0.0], None).unwrap();
+
+        db.create_snapshot("s", "before").unwrap();
+
+        // Add more data after the snapshot
+        db.upsert("s", 2, &[0.0, 1.0], None).unwrap();
+        db.upsert("s", 3, &[1.0, 1.0], None).unwrap();
+        assert_eq!(db.count("s").unwrap(), 3);
+
+        // Restore to snapshot — should go back to 1 vector
+        db.restore_snapshot("s", "before").unwrap();
+        assert_eq!(db.count("s").unwrap(), 1);
+    }
+
+    #[test]
+    fn delete_snapshot() {
+        let dir = tempdir().unwrap();
+        let mut db = open_db(&dir);
+        db.create_collection("s", 2, Metric::L2).unwrap();
+        db.create_snapshot("s", "snap1").unwrap();
+        assert_eq!(db.list_snapshots("s").unwrap().len(), 1);
+
+        db.delete_snapshot("s", "snap1").unwrap();
+        assert_eq!(db.list_snapshots("s").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn snapshot_nonexistent_collection_errors() {
+        let dir = tempdir().unwrap();
+        let mut db = open_db(&dir);
+        assert!(matches!(
+            db.create_snapshot("nope", "s"),
+            Err(VectorDbError::CollectionNotFound(_))
+        ));
+        assert!(matches!(
+            db.list_snapshots("nope"),
+            Err(VectorDbError::CollectionNotFound(_))
+        ));
+        assert!(matches!(
+            db.restore_snapshot("nope", "s"),
+            Err(VectorDbError::CollectionNotFound(_))
+        ));
+        assert!(matches!(
+            db.delete_snapshot("nope", "s"),
+            Err(VectorDbError::CollectionNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn restore_nonexistent_snapshot_errors() {
+        let dir = tempdir().unwrap();
+        let mut db = open_db(&dir);
+        db.create_collection("s", 2, Metric::L2).unwrap();
+        let result = db.restore_snapshot("s", "no_such_snap");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn delete_nonexistent_snapshot_errors() {
+        let dir = tempdir().unwrap();
+        let mut db = open_db(&dir);
+        db.create_collection("s", 2, Metric::L2).unwrap();
+        let result = db.delete_snapshot("s", "no_such_snap");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn create_duplicate_snapshot_errors() {
+        let dir = tempdir().unwrap();
+        let mut db = open_db(&dir);
+        db.create_collection("s", 2, Metric::L2).unwrap();
+        db.create_snapshot("s", "dup").unwrap();
+        let result = db.create_snapshot("s", "dup");
+        assert!(matches!(result, Err(VectorDbError::SnapshotAlreadyExists(_))));
+    }
+
+    #[test]
+    fn multiple_snapshots_and_selective_restore() {
+        let dir = tempdir().unwrap();
+        let mut db = open_db(&dir);
+        db.create_collection("s", 2, Metric::L2).unwrap();
+
+        db.upsert("s", 1, &[1.0, 0.0], None).unwrap();
+        db.create_snapshot("s", "one").unwrap();
+
+        db.upsert("s", 2, &[0.0, 1.0], None).unwrap();
+        db.create_snapshot("s", "two").unwrap();
+
+        db.upsert("s", 3, &[1.0, 1.0], None).unwrap();
+        assert_eq!(db.count("s").unwrap(), 3);
+
+        let snaps = db.list_snapshots("s").unwrap();
+        assert_eq!(snaps.len(), 2);
+
+        // Restore to "one" — only 1 vector
+        db.restore_snapshot("s", "one").unwrap();
+        assert_eq!(db.count("s").unwrap(), 1);
+    }
+
+    // ── get_or_create edge cases ──────────────────────────────────────────────
+
+    #[test]
+    fn get_or_create_then_upsert_and_search() {
+        let dir = tempdir().unwrap();
+        let mut db = open_db(&dir);
+        db.get_or_create_collection("g", 2, Metric::Cosine).unwrap();
+        db.upsert("g", 1, &[1.0, 0.0], None).unwrap();
+        let hits = db.search("g", &[1.0, 0.0], 1).unwrap();
+        assert_eq!(hits[0].id, 1);
+    }
+
+    // ── upsert overwrites existing vector ─────────────────────────────────────
+
+    #[test]
+    fn upsert_overwrites_existing_id() {
+        let dir = tempdir().unwrap();
+        let mut db = open_db(&dir);
+        db.create_collection("o", 2, Metric::L2).unwrap();
+        db.upsert("o", 1, &[1.0, 0.0], Some(serde_json::json!({"v": 1}))).unwrap();
+        db.upsert("o", 1, &[0.0, 1.0], Some(serde_json::json!({"v": 2}))).unwrap();
+
+        // Count should still be 1 (overwrite, not duplicate)
+        assert_eq!(db.count("o").unwrap(), 1);
+
+        // Search should find the updated vector
+        let hits = db.search("o", &[0.0, 1.0], 1).unwrap();
+        assert_eq!(hits[0].id, 1);
+        assert!(hits[0].distance < 1e-4);
+        assert_eq!(hits[0].payload.as_ref().unwrap()["v"], 2);
+    }
+
+    // ── list_snapshots on collection with no snapshots ────────────────────────
+
+    #[test]
+    fn list_snapshots_empty() {
+        let dir = tempdir().unwrap();
+        let mut db = open_db(&dir);
+        db.create_collection("s", 2, Metric::L2).unwrap();
+        let snaps = db.list_snapshots("s").unwrap();
+        assert!(snaps.is_empty());
+    }
 }

@@ -347,4 +347,190 @@ mod tests {
         assert_eq!(results.len(), 5);
         assert!(results[0].distance < 0.001, "dist={}", results[0].distance);
     }
+
+    // ── add_batch_raw tests ─────────────────────────────────────────────
+
+    #[test]
+    fn add_batch_raw_basic() {
+        let mut idx = Fp16FlatIndex::new(3, Metric::L2);
+        let data = vec![
+            1.0, 0.0, 0.0,
+            0.0, 1.0, 0.0,
+            0.0, 0.0, 1.0,
+        ];
+        idx.add_batch_raw(&data, 3, 0).unwrap();
+        assert_eq!(idx.len(), 3);
+    }
+
+    #[test]
+    fn add_batch_raw_search_after() {
+        let mut idx = Fp16FlatIndex::new(3, Metric::L2);
+        let data = vec![
+            1.0, 0.0, 0.0,
+            0.0, 1.0, 0.0,
+        ];
+        idx.add_batch_raw(&data, 3, 10).unwrap();
+        let results = idx.search(&[1.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(results[0].id, 10);
+        assert!(results[0].distance < 0.001);
+    }
+
+    #[test]
+    fn add_batch_raw_empty_buffer() {
+        let mut idx = Fp16FlatIndex::new(3, Metric::L2);
+        idx.add_batch_raw(&[], 3, 0).unwrap();
+        assert_eq!(idx.len(), 0);
+    }
+
+    #[test]
+    fn add_batch_raw_dim_mismatch() {
+        let mut idx = Fp16FlatIndex::new(3, Metric::L2);
+        let err = idx.add_batch_raw(&[1.0; 4], 2, 0).unwrap_err();
+        assert!(matches!(err, VectorDbError::DimensionMismatch { expected: 3, got: 2 }));
+    }
+
+    #[test]
+    fn add_batch_raw_not_multiple_of_dim() {
+        let mut idx = Fp16FlatIndex::new(3, Metric::L2);
+        let err = idx.add_batch_raw(&[1.0; 5], 3, 0).unwrap_err();
+        assert!(matches!(err, VectorDbError::InvalidConfig(_)));
+    }
+
+    // ── DotProduct metric ───────────────────────────────────────────────
+
+    #[test]
+    fn dot_product_metric_ordering() {
+        let mut idx = Fp16FlatIndex::new(3, Metric::DotProduct);
+        idx.add(1, &[1.0, 0.0, 0.0]).unwrap();
+        idx.add(2, &[0.0, 1.0, 0.0]).unwrap();
+        idx.add(3, &[0.5, 0.5, 0.0]).unwrap();
+
+        let results = idx.search(&[1.0, 0.0, 0.0], 3).unwrap();
+        assert_eq!(results[0].id, 1);
+    }
+
+    // ── k > total vectors ───────────────────────────────────────────────
+
+    #[test]
+    fn k_greater_than_total_vectors() {
+        let mut idx = Fp16FlatIndex::new(3, Metric::L2);
+        for i in 0..5u64 {
+            let mut v = vec![0.0f32; 3];
+            v[(i as usize) % 3] = 1.0;
+            idx.add(i, &v).unwrap();
+        }
+        let results = idx.search(&[1.0, 0.0, 0.0], 100).unwrap();
+        assert_eq!(results.len(), 5);
+    }
+
+    // ── Mixed add() and add_batch_raw() ─────────────────────────────────
+
+    #[test]
+    fn mixed_add_and_batch() {
+        let mut idx = Fp16FlatIndex::new(3, Metric::L2);
+        idx.add(0, &[1.0, 0.0, 0.0]).unwrap();
+        idx.add(1, &[0.0, 1.0, 0.0]).unwrap();
+        let batch = vec![
+            0.0, 0.0, 1.0,  // id 100
+            0.5, 0.5, 0.0,  // id 101
+        ];
+        idx.add_batch_raw(&batch, 3, 100).unwrap();
+        assert_eq!(idx.len(), 4);
+
+        let results = idx.search(&[1.0, 0.0, 0.0], 4).unwrap();
+        assert_eq!(results.len(), 4);
+        assert_eq!(results[0].id, 0);
+    }
+
+    // ── Delete after batch insert ───────────────────────────────────────
+
+    #[test]
+    fn delete_after_batch_insert() {
+        let mut idx = Fp16FlatIndex::new(3, Metric::L2);
+        let data = vec![
+            1.0, 0.0, 0.0,
+            0.0, 1.0, 0.0,
+            0.0, 0.0, 1.0,
+        ];
+        idx.add_batch_raw(&data, 3, 0).unwrap();
+        assert_eq!(idx.len(), 3);
+
+        assert!(idx.delete(1));
+        assert_eq!(idx.len(), 2);
+
+        let results = idx.search(&[0.0, 1.0, 0.0], 3).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| r.id != 1));
+    }
+
+    // ── Negative value precision ────────────────────────────────────────
+
+    #[test]
+    fn negative_value_precision() {
+        let v: Vec<f32> = vec![-0.1, -0.25, -0.5, -0.75, -1.0];
+        let fp16v = Fp16Vec::encode(&v);
+        let mut out = Vec::new();
+        fp16v.decode_into(&mut out);
+        for (orig, decoded) in v.iter().zip(out.iter()) {
+            let err = (orig - decoded).abs();
+            assert!(err < 0.001, "orig={orig} decoded={decoded} err={err}");
+        }
+    }
+
+    #[test]
+    fn negative_value_search_ordering() {
+        let mut idx = Fp16FlatIndex::new(3, Metric::L2);
+        idx.add(1, &[-1.0, -0.5, -0.2]).unwrap();
+        idx.add(2, &[1.0, 0.5, 0.2]).unwrap();
+        let results = idx.search(&[-1.0, -0.5, -0.2], 2).unwrap();
+        assert_eq!(results[0].id, 1);
+        assert!(results[0].distance < 0.001);
+    }
+
+    // ── Sequential batch calls ──────────────────────────────────────────
+
+    #[test]
+    fn sequential_batch_calls() {
+        let mut idx = Fp16FlatIndex::new(3, Metric::L2);
+        let batch1 = vec![
+            1.0, 0.0, 0.0,
+            0.0, 1.0, 0.0,
+        ];
+        idx.add_batch_raw(&batch1, 3, 0).unwrap();
+        assert_eq!(idx.len(), 2);
+
+        let batch2 = vec![
+            0.0, 0.0, 1.0,
+            0.5, 0.5, 0.0,
+        ];
+        idx.add_batch_raw(&batch2, 3, 10).unwrap();
+        assert_eq!(idx.len(), 4);
+
+        let batch3 = vec![
+            0.3, 0.3, 0.3,
+        ];
+        idx.add_batch_raw(&batch3, 3, 20).unwrap();
+        assert_eq!(idx.len(), 5);
+
+        // All vectors from all batches should be searchable
+        let results = idx.search(&[1.0, 0.0, 0.0], 5).unwrap();
+        assert_eq!(results.len(), 5);
+        assert_eq!(results[0].id, 0); // exact match from batch1
+    }
+
+    #[test]
+    fn sequential_batches_with_overlapping_ids() {
+        let mut idx = Fp16FlatIndex::new(3, Metric::L2);
+        let batch1 = vec![1.0, 0.0, 0.0];
+        idx.add_batch_raw(&batch1, 3, 0).unwrap();
+
+        // Second batch starts at id=0 again — should overwrite
+        let batch2 = vec![0.0, 1.0, 0.0];
+        idx.add_batch_raw(&batch2, 3, 0).unwrap();
+        assert_eq!(idx.len(), 1);
+
+        let results = idx.search(&[0.0, 1.0, 0.0], 1).unwrap();
+        assert_eq!(results[0].id, 0);
+        assert!(results[0].distance < 0.001);
+    }
 }

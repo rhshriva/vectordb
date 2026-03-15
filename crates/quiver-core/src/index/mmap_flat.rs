@@ -573,4 +573,389 @@ mod tests {
             assert_eq!(r[0].id, 1);
         }
     }
+
+    // ── Additional coverage tests ─────────────────────────────────────────────
+
+    #[test]
+    fn add_batch_raw_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut idx = make_index(dir.path());
+        // 4 vectors of dim 3
+        let raw = vec![
+            1.0, 0.0, 0.0,
+            0.0, 1.0, 0.0,
+            0.0, 0.0, 1.0,
+            1.0, 1.0, 1.0,
+        ];
+        idx.add_batch_raw(&raw, 3, 10).unwrap();
+        assert_eq!(idx.len(), 4);
+        let r = idx.search(&[1.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(r[0].id, 10);
+    }
+
+    #[test]
+    fn add_batch_raw_flush_and_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("batch.mmap");
+        let mut idx = MmapFlatIndex::new(3, Metric::L2, &path).unwrap();
+        let raw = vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        idx.add_batch_raw(&raw, 3, 0).unwrap();
+        idx.flush();
+        assert_eq!(idx.file_count, 2);
+        // Reopen
+        let idx2 = MmapFlatIndex::new(3, Metric::L2, &path).unwrap();
+        assert_eq!(idx2.len(), 2);
+        let r = idx2.search(&[0.0, 1.0, 0.0], 1).unwrap();
+        assert_eq!(r[0].id, 1);
+    }
+
+    #[test]
+    fn add_batch_raw_dim_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut idx = make_index(dir.path());
+        let raw = vec![1.0, 2.0, 3.0, 4.0];
+        let result = idx.add_batch_raw(&raw, 2, 0);
+        assert!(matches!(result, Err(VectorDbError::DimensionMismatch { expected: 3, got: 2 })));
+    }
+
+    #[test]
+    fn add_batch_raw_not_multiple_of_dim() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut idx = make_index(dir.path());
+        let raw = vec![1.0, 2.0, 3.0, 4.0]; // 4 not divisible by 3
+        let result = idx.add_batch_raw(&raw, 3, 0);
+        assert!(matches!(result, Err(VectorDbError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn search_dimension_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut idx = make_index(dir.path());
+        idx.add(1, &[1.0, 0.0, 0.0]).unwrap();
+        let result = idx.search(&[1.0, 0.0], 1);
+        assert!(matches!(result, Err(VectorDbError::DimensionMismatch { expected: 3, got: 2 })));
+    }
+
+    #[test]
+    fn search_k_zero_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut idx = make_index(dir.path());
+        idx.add(1, &[1.0, 0.0, 0.0]).unwrap();
+        let r = idx.search(&[1.0, 0.0, 0.0], 0).unwrap();
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn search_empty_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = make_index(dir.path());
+        let r = idx.search(&[1.0, 0.0, 0.0], 5).unwrap();
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn search_k_greater_than_len() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut idx = make_index(dir.path());
+        idx.add(1, &[1.0, 0.0, 0.0]).unwrap();
+        let r = idx.search(&[1.0, 0.0, 0.0], 100).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].id, 1);
+    }
+
+    #[test]
+    fn delete_nonexistent_returns_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut idx = make_index(dir.path());
+        assert!(!idx.delete(999));
+    }
+
+    #[test]
+    fn delete_nonexistent_from_file_returns_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vecs.mmap");
+        let mut idx = MmapFlatIndex::new(3, Metric::L2, &path).unwrap();
+        idx.add(1, &[1.0, 0.0, 0.0]).unwrap();
+        idx.flush();
+        assert!(!idx.delete(999));
+    }
+
+    #[test]
+    fn config_returns_correct_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = make_index(dir.path());
+        let cfg = idx.config();
+        assert_eq!(cfg.dimensions, 3);
+        assert_eq!(cfg.metric, Metric::L2);
+    }
+
+    #[test]
+    fn flush_noop_when_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vecs.mmap");
+        let mut idx = MmapFlatIndex::new(3, Metric::L2, &path).unwrap();
+        // flush on empty index should be a no-op, no file created
+        idx.flush();
+        assert!(!path.exists());
+        assert_eq!(idx.len(), 0);
+    }
+
+    #[test]
+    fn reinsert_deleted_id_via_staging() {
+        // When an id is deleted then re-added, the deleted set is cleared so the
+        // new staging version is visible in search. This exercises the
+        // `self.deleted.remove(&id)` path in `add()`.
+        let dir = tempfile::tempdir().unwrap();
+        let mut idx = make_index(dir.path());
+        // Add to staging, delete, re-add
+        idx.add(1, &[1.0, 0.0, 0.0]).unwrap();
+        assert!(idx.delete(1));
+        assert_eq!(idx.len(), 0);
+        idx.add(1, &[0.0, 0.0, 1.0]).unwrap();
+        assert_eq!(idx.len(), 1);
+        let r = idx.search(&[0.0, 0.0, 1.0], 1).unwrap();
+        assert_eq!(r[0].id, 1);
+        assert!(r[0].distance < 1e-6);
+    }
+
+    #[test]
+    fn iter_vectors_file_and_staging_combined() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vecs.mmap");
+        let mut idx = MmapFlatIndex::new(3, Metric::L2, &path).unwrap();
+        // Add to file
+        idx.add(1, &[1.0, 0.0, 0.0]).unwrap();
+        idx.add(2, &[0.0, 1.0, 0.0]).unwrap();
+        idx.flush();
+        // Add to staging
+        idx.add(3, &[0.0, 0.0, 1.0]).unwrap();
+        let mut ids: Vec<u64> = idx.iter_vectors().map(|(id, _)| id).collect();
+        ids.sort();
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn compact_preserves_staging_vectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vecs.mmap");
+        let mut idx = MmapFlatIndex::new(3, Metric::L2, &path).unwrap();
+        idx.add(1, &[1.0, 0.0, 0.0]).unwrap();
+        idx.add(2, &[0.0, 1.0, 0.0]).unwrap();
+        idx.flush();
+        // Delete from file and add a new staging vector
+        idx.delete(1);
+        idx.add(3, &[0.0, 0.0, 1.0]).unwrap();
+        idx.flush(); // compact: merges remaining file + staging
+        assert_eq!(idx.file_count, 2); // id 2 from file + id 3 from staging
+        assert!(idx.staging.is_empty());
+        assert!(idx.deleted.is_empty());
+        let mut ids: Vec<u64> = idx.iter_vectors().map(|(id, _)| id).collect();
+        ids.sort();
+        assert_eq!(ids, vec![2, 3]);
+    }
+
+    #[test]
+    fn persistence_after_compact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vecs.mmap");
+        {
+            let mut idx = MmapFlatIndex::new(3, Metric::L2, &path).unwrap();
+            idx.add(1, &[1.0, 0.0, 0.0]).unwrap();
+            idx.add(2, &[0.0, 1.0, 0.0]).unwrap();
+            idx.add(3, &[0.0, 0.0, 1.0]).unwrap();
+            idx.flush();
+            idx.delete(2);
+            idx.flush(); // compact
+        }
+        // Reopen and verify
+        let idx = MmapFlatIndex::new(3, Metric::L2, &path).unwrap();
+        assert_eq!(idx.len(), 2);
+        let mut ids: Vec<u64> = idx.iter_vectors().map(|(id, _)| id).collect();
+        ids.sort();
+        assert_eq!(ids, vec![1, 3]);
+    }
+
+    #[test]
+    fn open_mmap_bad_magic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad_magic.mmap");
+        std::fs::write(&path, &[0u8; 32]).unwrap();
+        let result = MmapFlatIndex::new(3, Metric::L2, &path);
+        assert!(matches!(result, Err(VectorDbError::Serialization(_))));
+    }
+
+    #[test]
+    fn open_mmap_file_too_small() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small.mmap");
+        std::fs::write(&path, &[0u8; 10]).unwrap();
+        let result = MmapFlatIndex::new(3, Metric::L2, &path);
+        assert!(matches!(result, Err(VectorDbError::Serialization(_))));
+    }
+
+    #[test]
+    fn open_mmap_dimension_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vecs.mmap");
+        {
+            let mut idx = MmapFlatIndex::new(3, Metric::L2, &path).unwrap();
+            idx.add(1, &[1.0, 0.0, 0.0]).unwrap();
+            idx.flush();
+        }
+        let result = MmapFlatIndex::new(5, Metric::L2, &path);
+        assert!(matches!(result, Err(VectorDbError::DimensionMismatch { expected: 5, got: 3 })));
+    }
+
+    #[test]
+    fn open_mmap_metric_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vecs.mmap");
+        {
+            let mut idx = MmapFlatIndex::new(3, Metric::L2, &path).unwrap();
+            idx.add(1, &[1.0, 0.0, 0.0]).unwrap();
+            idx.flush();
+        }
+        let result = MmapFlatIndex::new(3, Metric::Cosine, &path);
+        assert!(matches!(result, Err(VectorDbError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn open_mmap_unknown_metric() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad_metric.mmap");
+        let mut header = Vec::new();
+        header.extend_from_slice(MAGIC);
+        header.extend_from_slice(&VERSION.to_le_bytes());
+        header.extend_from_slice(&3u32.to_le_bytes());
+        header.extend_from_slice(&99u32.to_le_bytes()); // invalid metric
+        header.extend_from_slice(&0u64.to_le_bytes());
+        header.extend_from_slice(&0u64.to_le_bytes());
+        std::fs::write(&path, &header).unwrap();
+        let result = MmapFlatIndex::new(3, Metric::L2, &path);
+        assert!(matches!(result, Err(VectorDbError::Serialization(_))));
+    }
+
+    #[test]
+    fn u32_to_metric_all_variants() {
+        assert_eq!(u32_to_metric(0), Some(Metric::L2));
+        assert_eq!(u32_to_metric(1), Some(Metric::Cosine));
+        assert_eq!(u32_to_metric(2), Some(Metric::DotProduct));
+        assert_eq!(u32_to_metric(3), None);
+        assert_eq!(u32_to_metric(255), None);
+    }
+
+    #[test]
+    fn metric_to_u32_roundtrip() {
+        for (m, expected) in [(Metric::L2, 0), (Metric::Cosine, 1), (Metric::DotProduct, 2)] {
+            assert_eq!(metric_to_u32(m), expected);
+            assert_eq!(u32_to_metric(expected), Some(m));
+        }
+    }
+
+    #[test]
+    fn search_after_all_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vecs.mmap");
+        let mut idx = MmapFlatIndex::new(3, Metric::L2, &path).unwrap();
+        idx.add(1, &[1.0, 0.0, 0.0]).unwrap();
+        idx.add(2, &[0.0, 1.0, 0.0]).unwrap();
+        idx.flush();
+        idx.delete(1);
+        idx.delete(2);
+        assert_eq!(idx.len(), 0);
+        let r = idx.search(&[1.0, 0.0, 0.0], 5).unwrap();
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn dot_product_search_after_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dot.mmap");
+        let mut idx = MmapFlatIndex::new(3, Metric::DotProduct, &path).unwrap();
+        idx.add(1, &[1.0, 0.0, 0.0]).unwrap();
+        idx.add(2, &[0.5, 0.5, 0.0]).unwrap();
+        idx.add(3, &[0.0, 0.0, 1.0]).unwrap();
+        idx.flush();
+        // Reopen and search
+        let idx2 = MmapFlatIndex::new(3, Metric::DotProduct, &path).unwrap();
+        let r = idx2.search(&[1.0, 0.0, 0.0], 1).unwrap();
+        // Dot product: distance = -dot. id=1 has dot=1.0 (smallest negative distance)
+        assert_eq!(r[0].id, 1);
+    }
+
+    #[test]
+    fn multiple_flush_cycles() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vecs.mmap");
+        let mut idx = MmapFlatIndex::new(3, Metric::L2, &path).unwrap();
+
+        // Cycle 1: add + flush
+        idx.add(1, &[1.0, 0.0, 0.0]).unwrap();
+        idx.flush();
+        assert_eq!(idx.file_count, 1);
+
+        // Cycle 2: add + flush (append)
+        idx.add(2, &[0.0, 1.0, 0.0]).unwrap();
+        idx.flush();
+        assert_eq!(idx.file_count, 2);
+
+        // Cycle 3: delete + add + flush (compact)
+        idx.delete(1);
+        idx.add(3, &[0.0, 0.0, 1.0]).unwrap();
+        idx.flush();
+        assert_eq!(idx.file_count, 2); // id 2 + id 3
+
+        // Cycle 4: add + flush (append again after compact)
+        idx.add(4, &[1.0, 1.0, 0.0]).unwrap();
+        idx.flush();
+        assert_eq!(idx.file_count, 3);
+
+        let mut ids: Vec<u64> = idx.iter_vectors().map(|(id, _)| id).collect();
+        ids.sort();
+        assert_eq!(ids, vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn delete_already_deleted_returns_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vecs.mmap");
+        let mut idx = MmapFlatIndex::new(3, Metric::L2, &path).unwrap();
+        idx.add(1, &[1.0, 0.0, 0.0]).unwrap();
+        idx.flush();
+        assert!(idx.delete(1));
+        // Second delete of same id should return false
+        assert!(!idx.delete(1));
+    }
+
+    #[test]
+    fn add_batch_raw_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut idx = make_index(dir.path());
+        idx.add_batch_raw(&[], 3, 0).unwrap();
+        assert_eq!(idx.len(), 0);
+    }
+
+    #[test]
+    fn record_stride_calculation() {
+        assert_eq!(record_stride(3), 8 + 4 * 3); // 20
+        assert_eq!(record_stride(128), 8 + 4 * 128); // 520
+        assert_eq!(record_stride(1), 12);
+    }
+
+    #[test]
+    fn file_live_count_accuracy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vecs.mmap");
+        let mut idx = MmapFlatIndex::new(3, Metric::L2, &path).unwrap();
+        assert_eq!(idx.file_live_count(), 0);
+        idx.add(1, &[1.0, 0.0, 0.0]).unwrap();
+        idx.add(2, &[0.0, 1.0, 0.0]).unwrap();
+        idx.add(3, &[0.0, 0.0, 1.0]).unwrap();
+        idx.flush();
+        assert_eq!(idx.file_live_count(), 3);
+        idx.delete(1);
+        assert_eq!(idx.file_live_count(), 2);
+        idx.delete(2);
+        assert_eq!(idx.file_live_count(), 1);
+    }
 }

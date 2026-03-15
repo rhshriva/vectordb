@@ -1,0 +1,19 @@
+# Build
+maturin>=1.7,<2
+
+# Core (no runtime dependencies - quiver_vector_db is self-contained)
+
+# Testing
+pytest
+numpy
+pytest-cov
+
+# Benchmarking (optional)
+# hnswlib
+# faiss-cpu
+# chromadb
+# usearch
+
+# Embedding providers (optional)
+# sentence-transformers>=2.0
+# openai>=1.0

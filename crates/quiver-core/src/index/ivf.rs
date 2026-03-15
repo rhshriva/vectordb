@@ -524,4 +524,251 @@ mod tests {
         let err = idx.add(1, &[1.0, 2.0]).unwrap_err();
         assert!(matches!(err, VectorDbError::DimensionMismatch { expected: 3, got: 2 }));
     }
+
+    // ── Additional coverage tests ─────────────────────────────────────────────
+
+    #[test]
+    fn search_dimension_mismatch() {
+        let cfg = IvfConfig { n_lists: 2, nprobe: 2, train_size: 100, max_iter: 5 };
+        let idx = IvfIndex::new(3, Metric::L2, cfg);
+        let err = idx.search(&[1.0, 2.0], 1).unwrap_err();
+        assert!(matches!(err, VectorDbError::DimensionMismatch { expected: 3, got: 2 }));
+    }
+
+    #[test]
+    fn search_k_zero_returns_empty() {
+        let cfg = IvfConfig { n_lists: 2, nprobe: 2, train_size: 100, max_iter: 5 };
+        let mut idx = IvfIndex::new(2, Metric::L2, cfg);
+        idx.add(1, &[1.0, 0.0]).unwrap();
+        let r = idx.search(&[1.0, 0.0], 0).unwrap();
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn search_k_greater_than_len() {
+        let cfg = IvfConfig { n_lists: 2, nprobe: 2, train_size: 100, max_iter: 5 };
+        let mut idx = IvfIndex::new(2, Metric::L2, cfg);
+        idx.add(1, &[1.0, 0.0]).unwrap();
+        idx.add(2, &[0.0, 1.0]).unwrap();
+        let r = idx.search(&[1.0, 0.0], 10).unwrap();
+        assert_eq!(r.len(), 2);
+    }
+
+    #[test]
+    fn search_empty_index() {
+        let cfg = IvfConfig { n_lists: 2, nprobe: 2, train_size: 100, max_iter: 5 };
+        let idx = IvfIndex::new(2, Metric::L2, cfg);
+        let r = idx.search(&[1.0, 0.0], 5).unwrap();
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn add_batch_raw_happy_path() {
+        let cfg = IvfConfig { n_lists: 2, nprobe: 2, train_size: 100, max_iter: 5 };
+        let mut idx = IvfIndex::new(2, Metric::L2, cfg);
+        let data = vec![1.0, 0.0, 0.0, 1.0, 2.0, 0.0];
+        idx.add_batch_raw(&data, 2, 10).unwrap();
+        assert_eq!(idx.len(), 3);
+        let r = idx.search(&[2.0, 0.0], 1).unwrap();
+        assert_eq!(r[0].id, 12);
+    }
+
+    #[test]
+    fn add_batch_raw_dimension_mismatch() {
+        let cfg = IvfConfig { n_lists: 2, nprobe: 2, train_size: 100, max_iter: 5 };
+        let mut idx = IvfIndex::new(3, Metric::L2, cfg);
+        let data = vec![1.0, 0.0, 0.0, 1.0];
+        let err = idx.add_batch_raw(&data, 2, 0).unwrap_err();
+        assert!(matches!(err, VectorDbError::DimensionMismatch { expected: 3, got: 2 }));
+    }
+
+    #[test]
+    fn add_batch_raw_not_multiple_of_dim() {
+        let cfg = IvfConfig { n_lists: 2, nprobe: 2, train_size: 100, max_iter: 5 };
+        let mut idx = IvfIndex::new(2, Metric::L2, cfg);
+        let data = vec![1.0, 0.0, 0.5]; // 3 elements, not multiple of 2
+        let err = idx.add_batch_raw(&data, 2, 0).unwrap_err();
+        assert!(matches!(err, VectorDbError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn add_batch_raw_triggers_training() {
+        let cfg = IvfConfig { n_lists: 2, nprobe: 2, train_size: 4, max_iter: 5 };
+        let mut idx = IvfIndex::new(2, Metric::L2, cfg);
+        let data: Vec<f32> = (0..8).map(|i| if i % 2 == 0 { (i / 2) as f32 } else { 0.0 }).collect();
+        idx.add_batch_raw(&data, 2, 0).unwrap();
+        assert!(idx.trained);
+        assert_eq!(idx.len(), 4);
+    }
+
+    #[test]
+    fn delete_nonexistent_from_trained_index() {
+        let mut idx = make_trained(16);
+        assert!(!idx.delete(999));
+    }
+
+    #[test]
+    fn cosine_metric_search() {
+        let cfg = IvfConfig { n_lists: 2, nprobe: 2, train_size: 4, max_iter: 10 };
+        let mut idx = IvfIndex::new(2, Metric::Cosine, cfg);
+        for i in 0..8u64 {
+            idx.add(i, &[(i as f32 + 1.0), (i as f32 + 1.0)]).unwrap();
+        }
+        let r = idx.search(&[1.0, 1.0], 1).unwrap();
+        // All vectors point in the same direction (x, x), so cosine distance should be ~0
+        assert!(r[0].distance < 0.01);
+    }
+
+    #[test]
+    fn dot_product_metric_search() {
+        let cfg = IvfConfig { n_lists: 2, nprobe: 2, train_size: 4, max_iter: 10 };
+        let mut idx = IvfIndex::new(2, Metric::DotProduct, cfg);
+        for i in 0..8u64 {
+            idx.add(i, &[i as f32, 0.0]).unwrap();
+        }
+        let r = idx.search(&[1.0, 0.0], 3).unwrap();
+        assert_eq!(r.len(), 3);
+        // Results should be ordered by distance (ascending)
+        for w in r.windows(2) {
+            assert!(w[0].distance <= w[1].distance + 1e-5);
+        }
+    }
+
+    #[test]
+    fn flush_on_already_trained_is_noop() {
+        let mut idx = make_trained(16);
+        assert!(idx.trained);
+        let len_before = idx.len();
+        idx.flush();
+        assert_eq!(idx.len(), len_before);
+    }
+
+    #[test]
+    fn flush_on_empty_staging_is_noop() {
+        let cfg = IvfConfig { n_lists: 2, nprobe: 2, train_size: 100, max_iter: 5 };
+        let mut idx = IvfIndex::new(2, Metric::L2, cfg);
+        assert!(!idx.trained);
+        idx.flush();
+        // train() returns early when staging is empty, so trained stays false
+        assert!(!idx.trained);
+    }
+
+    #[test]
+    fn iter_vectors_untrained() {
+        let cfg = IvfConfig { n_lists: 2, nprobe: 2, train_size: 100, max_iter: 5 };
+        let mut idx = IvfIndex::new(2, Metric::L2, cfg);
+        idx.add(1, &[1.0, 0.0]).unwrap();
+        idx.add(2, &[0.0, 1.0]).unwrap();
+        let mut ids: Vec<u64> = idx.iter_vectors().map(|(id, _)| id).collect();
+        ids.sort();
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn save_load_untrained() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ivf_untrained.bin");
+        let cfg = IvfConfig { n_lists: 2, nprobe: 2, train_size: 100, max_iter: 5 };
+        let mut idx = IvfIndex::new(2, Metric::L2, cfg);
+        idx.add(1, &[1.0, 0.0]).unwrap();
+        idx.add(2, &[0.0, 1.0]).unwrap();
+        idx.save(&path).unwrap();
+        let loaded = IvfIndex::load(&path).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert!(!loaded.trained);
+        let r = loaded.search(&[1.0, 0.0], 1).unwrap();
+        assert_eq!(r[0].id, 1);
+    }
+
+    #[test]
+    fn load_nonexistent_file_errors() {
+        let result = IvfIndex::load("/tmp/nonexistent_ivf_test_file.bin");
+        assert!(matches!(result, Err(VectorDbError::Io(_))));
+    }
+
+    #[test]
+    fn nprobe_clamped_to_centroids_len() {
+        // nprobe > n_lists should be clamped, not panic
+        let cfg = IvfConfig { n_lists: 2, nprobe: 100, train_size: 4, max_iter: 10 };
+        let mut idx = IvfIndex::new(2, Metric::L2, cfg);
+        for i in 0..8u64 {
+            idx.add(i, &[i as f32, 0.0]).unwrap();
+        }
+        let r = idx.search(&[3.0, 0.0], 3).unwrap();
+        assert_eq!(r.len(), 3);
+        assert_eq!(r[0].id, 3);
+    }
+
+    #[test]
+    fn search_trained_with_staging_vectors() {
+        // After training, add more vectors (below next train threshold) and search
+        // should scan both posting lists AND staging
+        let cfg = IvfConfig { n_lists: 2, nprobe: 2, train_size: 8, max_iter: 10 };
+        let mut idx = IvfIndex::new(2, Metric::L2, cfg);
+        for i in 0..8u64 {
+            idx.add(i, &[i as f32, 0.0]).unwrap();
+        }
+        assert!(idx.trained);
+        // Post-training insert goes to posting list, not staging
+        idx.add(100, &[100.0, 0.0]).unwrap();
+        let r = idx.search(&[100.0, 0.0], 1).unwrap();
+        assert_eq!(r[0].id, 100);
+    }
+
+    #[test]
+    fn config_returns_correct_values() {
+        let cfg = IvfConfig { n_lists: 2, nprobe: 2, train_size: 100, max_iter: 5 };
+        let idx = IvfIndex::new(5, Metric::Cosine, cfg);
+        assert_eq!(idx.config().dimensions, 5);
+        assert_eq!(idx.config().metric, Metric::Cosine);
+    }
+
+    #[test]
+    fn len_counts_staging_and_posting_lists() {
+        let cfg = IvfConfig { n_lists: 2, nprobe: 2, train_size: 4, max_iter: 10 };
+        let mut idx = IvfIndex::new(2, Metric::L2, cfg);
+        assert_eq!(idx.len(), 0);
+        idx.add(0, &[0.0, 0.0]).unwrap();
+        assert_eq!(idx.len(), 1);
+        idx.add(1, &[1.0, 0.0]).unwrap();
+        assert_eq!(idx.len(), 2);
+        idx.add(2, &[2.0, 0.0]).unwrap();
+        assert_eq!(idx.len(), 3);
+        // Adding 4th triggers training (train_size=4)
+        idx.add(3, &[3.0, 0.0]).unwrap();
+        assert!(idx.trained);
+        assert_eq!(idx.len(), 4);
+    }
+
+    #[test]
+    fn kmeans_with_fewer_vectors_than_lists() {
+        // n_lists=4 but only 2 vectors — k should be clamped to 2
+        let cfg = IvfConfig { n_lists: 4, nprobe: 4, train_size: 2, max_iter: 5 };
+        let mut idx = IvfIndex::new(2, Metric::L2, cfg);
+        idx.add(0, &[0.0, 0.0]).unwrap();
+        idx.add(1, &[10.0, 0.0]).unwrap();
+        assert!(idx.trained);
+        assert!(idx.centroids.len() <= 2);
+        let r = idx.search(&[10.0, 0.0], 1).unwrap();
+        assert_eq!(r[0].id, 1);
+    }
+
+    #[test]
+    fn delete_all_from_posting_list() {
+        let mut idx = make_trained(16);
+        for i in 0..16u64 {
+            assert!(idx.delete(i));
+        }
+        assert_eq!(idx.len(), 0);
+        let r = idx.search(&[5.0, 0.0], 5).unwrap();
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn add_batch_raw_empty_buffer() {
+        let cfg = IvfConfig { n_lists: 2, nprobe: 2, train_size: 100, max_iter: 5 };
+        let mut idx = IvfIndex::new(2, Metric::L2, cfg);
+        idx.add_batch_raw(&[], 2, 0).unwrap();
+        assert_eq!(idx.len(), 0);
+    }
 }
