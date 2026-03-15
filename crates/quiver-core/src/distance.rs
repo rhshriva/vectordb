@@ -210,11 +210,17 @@ fn dispatch_dot(a: &[f32], b: &[f32]) -> f32 {
 
 #[inline(always)]
 fn dispatch_l2_squared_batch4(query: &[f32], vecs: [&[f32]; 4]) -> [f32; 4] {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return unsafe { x86_64::l2_squared_batch4_avx2_fma(query, vecs) };
+        }
+    }
     #[cfg(target_arch = "aarch64")]
     {
         return unsafe { aarch64::l2_squared_batch4_neon(query, vecs) };
     }
-    // Fallback: 4 individual calls (still benefits from query cache locality)
+    // Fallback: 4 individual calls
     #[allow(unreachable_code)]
     [
         scalar::l2_squared(query, vecs[0]),
@@ -226,6 +232,12 @@ fn dispatch_l2_squared_batch4(query: &[f32], vecs: [&[f32]; 4]) -> [f32; 4] {
 
 #[inline(always)]
 fn dispatch_dot_batch4(query: &[f32], vecs: [&[f32]; 4]) -> [f32; 4] {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return unsafe { x86_64::dot_batch4_avx2_fma(query, vecs) };
+        }
+    }
     #[cfg(target_arch = "aarch64")]
     {
         return unsafe { aarch64::dot_batch4_neon(query, vecs) };
@@ -335,6 +347,109 @@ mod x86_64 {
 
         for i in (chunks * 8)..n {
             result += *a.get_unchecked(i) * *b.get_unchecked(i);
+        }
+        result
+    }
+
+    /// Horizontal sum of a 256-bit float register to a single f32.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn hsum256(v: __m256) -> f32 {
+        let hi = _mm256_extractf128_ps(v, 1);
+        let lo = _mm256_castps256_ps128(v);
+        let sum4 = _mm_add_ps(hi, lo);
+        let shuf = _mm_movehdup_ps(sum4);
+        let sum2 = _mm_add_ps(sum4, shuf);
+        let shuf = _mm_movehl_ps(shuf, sum2);
+        let sum1 = _mm_add_ss(sum2, shuf);
+        _mm_cvtss_f32(sum1)
+    }
+
+    /// Batch-4 squared L2 distance using AVX2 + FMA.
+    ///
+    /// Loads query once per chunk, computes 4 distances with independent
+    /// accumulators for instruction-level parallelism. Processes 8 floats/iter.
+    ///
+    /// # Safety
+    /// Caller must ensure the CPU supports `avx2` and `fma`.
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn l2_squared_batch4_avx2_fma(query: &[f32], vecs: [&[f32]; 4]) -> [f32; 4] {
+        let n = query.len();
+        let chunks = n / 8;
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
+        let mut acc2 = _mm256_setzero_ps();
+        let mut acc3 = _mm256_setzero_ps();
+
+        for i in 0..chunks {
+            let vq = _mm256_loadu_ps(query.as_ptr().add(i * 8));
+
+            let v0 = _mm256_loadu_ps(vecs[0].as_ptr().add(i * 8));
+            let d0 = _mm256_sub_ps(vq, v0);
+            acc0 = _mm256_fmadd_ps(d0, d0, acc0);
+
+            let v1 = _mm256_loadu_ps(vecs[1].as_ptr().add(i * 8));
+            let d1 = _mm256_sub_ps(vq, v1);
+            acc1 = _mm256_fmadd_ps(d1, d1, acc1);
+
+            let v2 = _mm256_loadu_ps(vecs[2].as_ptr().add(i * 8));
+            let d2 = _mm256_sub_ps(vq, v2);
+            acc2 = _mm256_fmadd_ps(d2, d2, acc2);
+
+            let v3 = _mm256_loadu_ps(vecs[3].as_ptr().add(i * 8));
+            let d3 = _mm256_sub_ps(vq, v3);
+            acc3 = _mm256_fmadd_ps(d3, d3, acc3);
+        }
+
+        let mut result = [hsum256(acc0), hsum256(acc1), hsum256(acc2), hsum256(acc3)];
+
+        for i in (chunks * 8)..n {
+            let q = *query.get_unchecked(i);
+            let d0 = q - *vecs[0].get_unchecked(i); result[0] += d0 * d0;
+            let d1 = q - *vecs[1].get_unchecked(i); result[1] += d1 * d1;
+            let d2 = q - *vecs[2].get_unchecked(i); result[2] += d2 * d2;
+            let d3 = q - *vecs[3].get_unchecked(i); result[3] += d3 * d3;
+        }
+        result
+    }
+
+    /// Batch-4 dot product using AVX2 + FMA.
+    ///
+    /// # Safety
+    /// Caller must ensure the CPU supports `avx2` and `fma`.
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn dot_batch4_avx2_fma(query: &[f32], vecs: [&[f32]; 4]) -> [f32; 4] {
+        let n = query.len();
+        let chunks = n / 8;
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
+        let mut acc2 = _mm256_setzero_ps();
+        let mut acc3 = _mm256_setzero_ps();
+
+        for i in 0..chunks {
+            let vq = _mm256_loadu_ps(query.as_ptr().add(i * 8));
+
+            let v0 = _mm256_loadu_ps(vecs[0].as_ptr().add(i * 8));
+            acc0 = _mm256_fmadd_ps(vq, v0, acc0);
+
+            let v1 = _mm256_loadu_ps(vecs[1].as_ptr().add(i * 8));
+            acc1 = _mm256_fmadd_ps(vq, v1, acc1);
+
+            let v2 = _mm256_loadu_ps(vecs[2].as_ptr().add(i * 8));
+            acc2 = _mm256_fmadd_ps(vq, v2, acc2);
+
+            let v3 = _mm256_loadu_ps(vecs[3].as_ptr().add(i * 8));
+            acc3 = _mm256_fmadd_ps(vq, v3, acc3);
+        }
+
+        let mut result = [hsum256(acc0), hsum256(acc1), hsum256(acc2), hsum256(acc3)];
+
+        for i in (chunks * 8)..n {
+            let q = *query.get_unchecked(i);
+            result[0] += q * *vecs[0].get_unchecked(i);
+            result[1] += q * *vecs[1].get_unchecked(i);
+            result[2] += q * *vecs[2].get_unchecked(i);
+            result[3] += q * *vecs[3].get_unchecked(i);
         }
         result
     }

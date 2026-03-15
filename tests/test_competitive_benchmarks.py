@@ -1,8 +1,8 @@
-"""Competitive benchmarks: Quiver vs faiss/hnswlib/chromadb — apple-to-apple comparison.
+"""Competitive benchmarks: Quiver vs faiss/hnswlib/chromadb/usearch/lancedb.
 
 Measures insert throughput, search latency, and recall@10 for every Quiver
-index type against its faiss equivalent (when available), plus hnswlib and
-chromadb for HNSW comparisons.
+index type against its faiss equivalent (when available), plus hnswlib,
+chromadb, usearch, and lancedb for additional comparisons.
 
 Uses add_batch_np (numpy buffer protocol) for all Quiver indexes to make the
 comparison fair — both Quiver and faiss receive contiguous numpy arrays.
@@ -11,7 +11,7 @@ Run:
     pytest tests/test_competitive_benchmarks.py -v -s
 
 Install competitors for full comparison:
-    pip install hnswlib faiss-cpu chromadb numpy
+    pip install hnswlib faiss-cpu chromadb usearch lancedb numpy
 """
 
 import os
@@ -114,7 +114,7 @@ def gt(vectors_np, queries_np):
 # ---------------------------------------------------------------------------
 
 class TestCompetitiveBenchmarks:
-    """Apple-to-apple benchmark: every Quiver index vs faiss/hnswlib/chromadb.
+    """Apple-to-apple benchmark: Quiver vs faiss/hnswlib/chromadb/usearch/lancedb.
 
     Uses add_batch_np (numpy buffer protocol) for all Quiver indexes so that
     both Quiver and faiss receive contiguous numpy arrays — a fair comparison.
@@ -125,9 +125,11 @@ class TestCompetitiveBenchmarks:
 
     Matching pairs:
         Quiver FlatIndex        <-> faiss IndexFlatL2         (exact brute-force)
+                                <-> LanceDB                   (brute-force, no index)
         Quiver HnswIndex        <-> faiss IndexHNSWFlat       (M=16, ef_c=200, ef_s=50)
                                 <-> hnswlib                   (same params)
                                 <-> chromadb                  (same HNSW params)
+                                <-> usearch                   (same HNSW params)
         Quiver QuantizedFlat    <-> faiss IndexScalarQuantizer (QT_8bit)
         Quiver IvfIndex         <-> faiss IndexIVFFlat        (nlist=32, nprobe=8)
         Quiver IvfPqIndex       <-> faiss IndexIVFPQ          (nlist=32, nprobe=8, m=8, nbits=4)
@@ -208,6 +210,27 @@ class TestCompetitiveBenchmarks:
                           f"{f_flat_lat:.3f}", f"{f_flat_rec:.4f}"))
         else:
             rows.append(("faiss Flat", "SKIP", "SKIP", "SKIP"))
+
+        # LanceDB (brute-force, no index)
+        lancedb_mod = try_import("lancedb")
+        if lancedb_mod:
+            lance_db = lancedb_mod.connect(str(tmp_path / "lancedb"))
+            lance_data = [{"id": i, "vector": vectors_np[i]} for i in range(N)]
+            t0 = time.perf_counter()
+            lance_tbl = lance_db.create_table("bench", data=lance_data, mode="overwrite")
+            lance_insert = N / (time.perf_counter() - t0)
+            lats, pred = [], []
+            for q in queries_np:
+                t0 = time.perf_counter()
+                results = lance_tbl.search(q).limit(K).to_list()
+                lats.append((time.perf_counter() - t0) * 1000)
+                pred.append([r["id"] for r in results])
+            lance_lat = statistics.mean(lats)
+            lance_rec = compute_recall(pred, gt)
+            rows.append(("LanceDB", f"{lance_insert:,.0f}",
+                          f"{lance_lat:.3f}", f"{lance_rec:.4f}"))
+        else:
+            rows.append(("LanceDB", "SKIP", "SKIP", "SKIP"))
 
         rows.append(("---", "---", "---", "---"))
 
@@ -310,6 +333,30 @@ class TestCompetitiveBenchmarks:
                           f"{chroma_lat:.3f}", f"{chroma_rec:.4f}"))
         else:
             rows.append(("ChromaDB", "SKIP", "SKIP", "SKIP"))
+
+        # usearch (HNSW)
+        usearch_mod = try_import("usearch")
+        if usearch_mod:
+            from usearch.index import Index as UsearchIndex
+            idx_u = UsearchIndex(ndim=DIM, metric='l2sq', dtype='f32',
+                                 connectivity=self.BENCH_M,
+                                 expansion_add=self.BENCH_EF_CONSTRUCTION,
+                                 expansion_search=self.BENCH_EF_SEARCH)
+            t0 = time.perf_counter()
+            idx_u.add(np.arange(N, dtype=np.int64), vectors_np)
+            u_insert = N / (time.perf_counter() - t0)
+            lats, pred = [], []
+            for q in queries_np:
+                t0 = time.perf_counter()
+                matches = idx_u.search(q, K)
+                lats.append((time.perf_counter() - t0) * 1000)
+                pred.append(matches.keys.tolist())
+            u_lat = statistics.mean(lats)
+            u_rec = compute_recall(pred, gt)
+            rows.append(("usearch", f"{u_insert:,.0f}",
+                          f"{u_lat:.3f}", f"{u_rec:.4f}"))
+        else:
+            rows.append(("usearch", "SKIP", "SKIP", "SKIP"))
 
         # faiss HNSW
         if faiss:

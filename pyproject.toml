@@ -30,7 +30,7 @@ classifiers = [
 
 [project.optional-dependencies]
 test = ["pytest", "numpy"]
-benchmark = ["pytest", "numpy", "hnswlib", "faiss-cpu", "chromadb", "usearch"]
+benchmark = ["pytest", "numpy", "hnswlib", "faiss-cpu", "chromadb", "usearch", "lancedb"]
 sentence-transformers = ["sentence-transformers>=2.0"]
 openai = ["openai>=1.0"]
 all = ["sentence-transformers>=2.0", "openai>=1.0"]

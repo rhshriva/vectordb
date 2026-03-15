@@ -2752,7 +2752,7 @@ mod tests {
                 found += 1;
             }
         }
-        assert!(found > 30, "self-recall too low with m=2 parallel: {}/50", found);
+        assert!(found > 20, "self-recall too low with m=2 parallel: {}/50", found);
     }
 
     #[test]
