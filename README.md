@@ -1,6 +1,6 @@
 <p align="center">
   <h1 align="center">Quiver</h1>
-  <p align="center">A fast, embedded vector database written in Rust with Python bindings.<br/>No server, no network — runs fully in-process with SIMD-accelerated search.</p>
+  <p align="center">A fast, embedded vector database written in Rust with Python bindings.<br/>Runs in-process by default — no server required. Optional REST API and OpenAI embedding client available.</p>
 </p>
 
 <p align="center">
@@ -44,16 +44,16 @@ maturin develop --release
 | **8 index types** | HNSW, Flat, Int8, FP16, IVF, IVF-PQ, Memory-mapped, Binary |
 | **Built-in embeddings** | sentence-transformers (local) and OpenAI API |
 | **Full-text search** | BM25 keyword search with hybrid dense+sparse fusion |
-| **3 distance metrics** | Cosine, L2, Dot Product — all SIMD-accelerated (AVX2/NEON) |
+| **3 distance metrics** | Cosine, L2, Dot Product — SIMD-accelerated (AVX2/NEON) for dense indexes; hardware `popcount` for binary |
 | **Payload filtering** | JSON metadata with 9 filter operators (`$eq`, `$ne`, `$in`, `$gt`, `$gte`, `$lt`, `$lte`, `$and`, `$or`) |
 | **Hybrid search** | Weighted fusion of dense vectors + sparse keyword signals |
 | **Multi-vector** | Multiple named embedding spaces per document (text + image) |
 | **Data versioning** | Create, list, restore, and delete collection snapshots |
 | **Batch upsert** | Efficient bulk insertion API |
-| **Parallel HNSW insert** | Multi-threaded insert via rayon micro-batching |
+| **Parallel HNSW insert** | Multi-threaded insert via rayon micro-batching (standalone `HnswIndex`) |
 | **WAL persistence** | Crash-safe writes with automatic compaction |
 | **IDE support** | Full type stubs (`py.typed` + `.pyi`) for autocompletion |
-| **Zero dependencies** | Single `pip install`, no external dependencies |
+| **No runtime dependencies** | Core wheel has no required runtime deps; optional extras for embeddings |
 
 ---
 
@@ -130,7 +130,7 @@ Benchmarks run on **GitHub Actions** CI runners — fully reproducible via `work
 | Mmap | 1,155K | 0.060 | 1.0000 | | 1,125K | 0.068 | 1.0000 |
 | Binary | 1,108K | 0.034 | 0.1130 | | 1,721K | 0.027 | 0.1140 |
 
-> FP16, Mmap, and Binary indexes are **unique to Quiver** — not available in faiss, usearch, or LanceDB.
+> FP16, Mmap, and Binary indexes are not offered by the competitors benchmarked above (faiss, usearch, LanceDB).
 
 ### Key Takeaways
 
@@ -138,8 +138,8 @@ Benchmarks run on **GitHub Actions** CI runners — fully reproducible via `work
 - **HNSW search**: Quiver **0.039ms** — **1.2x faster** than faiss (0.047ms), **2.4x faster** than usearch (0.094ms)
 - **HNSW single-thread insert**: Quiver 11.7K — **1.3x faster** than faiss (9.0K)
 - **Int8 insert on ARM64**: Quiver **4.3M** — **1.3x faster** than faiss SQ8 (3.3M)
-- **Recall parity**: Quiver matches or exceeds competitors across all index types
-- **3 unique index types** (FP16, Mmap, Binary) not available in any competitor
+- **Competitive recall**: Quiver recall is within 1–2% of faiss across index types (e.g., HNSW 0.941 vs 0.951)
+- **3 additional index types** (FP16, Mmap, Binary) not offered by the competitors benchmarked above
 
 Reproduce locally: `pip install quiver-vector-db[benchmark] && pytest tests/test_competitive_benchmarks.py -v -s`
 Reproduce on CI: trigger the **Performance Benchmarks** workflow from the [Actions tab](https://github.com/rhshriva/Quiver/actions/workflows/benchmark.yml)
@@ -439,7 +439,7 @@ idx = quiver.BinaryFlatIndex(dimensions=384, metric="l2")
 | L2 (Euclidean) | `"l2"` | Geometry, sensor data |
 | Dot Product | `"dot_product"` | Pre-normalized vectors |
 
-All metrics use SIMD-accelerated kernels (AVX2+FMA on x86, NEON on ARM).
+Cosine, L2, and Dot Product use SIMD-accelerated kernels (AVX2+FMA on x86, NEON on ARM) for all dense index types. BinaryFlatIndex uses packed-bit Hamming distance with hardware `popcount`.
 
 ## IDE Support
 
@@ -472,8 +472,11 @@ cargo test --workspace
 # Python functional tests (~170 tests)
 pytest tests/ -v --ignore=tests/test_perf.py --ignore=tests/test_benchmark.py --ignore=tests/test_perf_regression.py
 
-# Performance benchmarks with apple-to-apple comparisons
+# Performance regression tests (internal thresholds)
 pytest tests/test_perf_regression.py -v -s
+
+# Competitive benchmarks (Quiver vs faiss, usearch, LanceDB, etc.)
+pytest tests/test_competitive_benchmarks.py -v -s
 ```
 
 ---
