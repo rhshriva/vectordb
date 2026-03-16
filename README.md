@@ -1,6 +1,6 @@
 <p align="center">
   <h1 align="center">Quiver</h1>
-  <p align="center">A fast, embedded vector database written in Rust with Python bindings.<br/>No server, no network — runs fully in-process with SIMD-accelerated search.</p>
+  <p align="center">A fast, embedded vector database written in Rust with Python bindings.<br/>Runs in-process by default — no server required. Optional REST API and OpenAI embedding client available.</p>
 </p>
 
 <p align="center">
@@ -44,16 +44,16 @@ maturin develop --release
 | **8 index types** | HNSW, Flat, Int8, FP16, IVF, IVF-PQ, Memory-mapped, Binary |
 | **Built-in embeddings** | sentence-transformers (local) and OpenAI API |
 | **Full-text search** | BM25 keyword search with hybrid dense+sparse fusion |
-| **3 distance metrics** | Cosine, L2, Dot Product — all SIMD-accelerated (AVX2/NEON) |
+| **3 distance metrics** | Cosine, L2, Dot Product — SIMD-accelerated (AVX2/NEON) for dense indexes; hardware `popcount` for binary |
 | **Payload filtering** | JSON metadata with 9 filter operators (`$eq`, `$ne`, `$in`, `$gt`, `$gte`, `$lt`, `$lte`, `$and`, `$or`) |
 | **Hybrid search** | Weighted fusion of dense vectors + sparse keyword signals |
 | **Multi-vector** | Multiple named embedding spaces per document (text + image) |
 | **Data versioning** | Create, list, restore, and delete collection snapshots |
 | **Batch upsert** | Efficient bulk insertion API |
-| **Parallel HNSW insert** | Multi-threaded insert via rayon micro-batching |
+| **Parallel HNSW insert** | Multi-threaded insert via rayon micro-batching (standalone `HnswIndex`) |
 | **WAL persistence** | Crash-safe writes with automatic compaction |
 | **IDE support** | Full type stubs (`py.typed` + `.pyi`) for autocompletion |
-| **Zero dependencies** | Single `pip install`, no external dependencies |
+| **No runtime dependencies** | Core wheel has no required runtime deps; optional extras for embeddings |
 
 ---
 
@@ -439,7 +439,7 @@ idx = quiver.BinaryFlatIndex(dimensions=384, metric="l2")
 | L2 (Euclidean) | `"l2"` | Geometry, sensor data |
 | Dot Product | `"dot_product"` | Pre-normalized vectors |
 
-All metrics use SIMD-accelerated kernels (AVX2+FMA on x86, NEON on ARM).
+Cosine, L2, and Dot Product use SIMD-accelerated kernels (AVX2+FMA on x86, NEON on ARM) for all dense index types. BinaryFlatIndex uses packed-bit Hamming distance with hardware `popcount`.
 
 ## IDE Support
 
@@ -472,8 +472,11 @@ cargo test --workspace
 # Python functional tests (~170 tests)
 pytest tests/ -v --ignore=tests/test_perf.py --ignore=tests/test_benchmark.py --ignore=tests/test_perf_regression.py
 
-# Performance benchmarks with apple-to-apple comparisons
+# Performance regression tests (internal thresholds)
 pytest tests/test_perf_regression.py -v -s
+
+# Competitive benchmarks (Quiver vs faiss, usearch, LanceDB, etc.)
+pytest tests/test_competitive_benchmarks.py -v -s
 ```
 
 ---

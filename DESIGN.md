@@ -43,7 +43,7 @@ This document explains how Quiver achieves high performance across all index typ
 └─────────────────────────────────────────────────────────────┘
 ```
 
-All eight index types share the same SIMD-accelerated distance kernels. The `VectorIndex` trait defines a common interface, so the collection layer can swap index types without changing any other code.
+Seven of the eight index types share the same SIMD-accelerated distance kernels (AVX2/NEON). The exception is `BinaryFlatIndex`, which uses packed-bit Hamming distance via XOR + `count_ones()` (hardware `popcount`) instead of the shared SIMD float kernels. The `VectorIndex` trait defines a common interface, so the collection layer can swap index types without changing any other code.
 
 ---
 
@@ -112,7 +112,7 @@ Standard sequential:          Batch-4 ILP:
 
 Because `acc0`, `acc1`, `acc2`, `acc3` are independent, the CPU can execute all 4 FMA instructions in a single cycle using both execution units and pipelining. This eliminates the data-dependency stall where each iteration waits for the previous result.
 
-**Where it's used:** HNSW neighbor scanning, IVF centroid search, flat brute-force search.
+**Where it's used:** HNSW neighbor scanning, IVF centroid search. (FlatIndex currently uses per-vector scalar distance calls; batch-4 ILP is a future enhancement for flat brute-force search.)
 
 ---
 
@@ -169,7 +169,7 @@ After  delete(id=7):    alive = [ T, F, T, T ]
                                      ↑ skipped during search
 ```
 
-The data compacts only on explicit `flush()`. This avoids expensive reallocation during mixed insert/delete workloads.
+There is currently no compaction pass — deleted slots remain as dead space. This avoids expensive reallocation during mixed insert/delete workloads. A future enhancement could add explicit compaction to reclaim dead slots.
 
 ### Result
 
@@ -217,12 +217,15 @@ Before (Vec<Vec<u32>>):
   layer0[1] → Vec at 0xB200 → [0, 2, 7]     ← 2 pointer dereferences
   layer0[2] → Vec at 0xC800 → [1, 5, 8, 12]
 
-After (flat buffer, stride = m_max0):
-  layer0: [3,5,12,0 | 0,2,7,0 | 1,5,8,12 | ...]
-           ↑ node 0   ↑ node 1   ↑ node 2
+After (flat buffer, stride = m_max0 + 1):
+  layer0: [3,5,12,0,0 | 0,2,7,0,0 | 1,5,8,12,0 | ...]
+           ↑ node 0     ↑ node 1     ↑ node 2
   counts: [3, 3, 4, ...]
 
-  Access node i's neighbors: layer0[i * m_max0 .. i * m_max0 + counts[i]]
+  Access node i's neighbors: layer0[i * (m_max0+1) .. i * (m_max0+1) + counts[i]]
+
+  The extra +1 slot allows temporary overflow during neighbor insertion
+  before pruning trims back to m_max0.
 ```
 
 One pointer dereference instead of two. The entire neighbor array fits in a few cache lines.
@@ -551,7 +554,7 @@ for i in range(10000):
 
 ### The Solution: Buffer Protocol (PEP 3118)
 
-Numpy arrays expose their raw memory via the buffer protocol. Quiver reads the underlying C array directly:
+Numpy arrays expose their raw memory via the buffer protocol. Quiver reads the underlying C array in a single bulk copy:
 
 ```
 Python numpy array:
@@ -559,11 +562,12 @@ Python numpy array:
   array.shape → (10000, 128)
 
 Rust side:
-  PyBuffer::get_bound(obj)    ← get pointer to numpy's memory
-  buf.copy_to_slice(&mut data) ← single memcpy of 10000 × 128 × 4 = 5.1 MB
+  PyBuffer::get_bound(obj)      ← get pointer to numpy's memory
+  buf.copy_to_slice(&mut data)  ← single memcpy into Rust-owned Vec<f32>
+                                   (10000 × 128 × 4 = 5.1 MB)
 ```
 
-No per-element Python overhead. One `memcpy` for the entire batch.
+This is a single bulk copy (not zero-copy), but eliminates all per-element Python overhead. One `memcpy` for the entire batch instead of N × D Python-to-Rust float extractions.
 
 ```python
 # Fast: 1 Python → Rust call, buffer protocol transfer
@@ -608,7 +612,7 @@ Speedup: ~500×
 | **IVF-PQ** | Asymmetric distance (ADC) | Precompute lookup table, O(m) vs O(D) | 16-64× fewer FLOPs |
 | **Mmap** | Memory-mapped file | OS-managed virtual memory paging | 100M+ vectors on 8GB RAM |
 | **Mmap** | Staging buffer | In-memory inserts, disk flush on demand | Fast writes, lazy persistence |
-| **Python** | Buffer protocol | Direct numpy memory access (PEP 3118) | ~500× vs per-element extract |
+| **Python** | Buffer protocol | Single bulk memcpy from numpy (PEP 3118) | ~500× vs per-element extract |
 | **Python** | Batch APIs | `add_batch_np()` — single call for N vectors | Eliminates Python loop overhead |
 | **K-Means** | GEMM assignment | Same matmul decomposition as IVF insert | 3-5× per training iteration |
 | **K-Means** | Early-stop convergence | Track `changed` flag, stop when stable | Skip unnecessary iterations |
@@ -629,4 +633,4 @@ Speedup: ~500×
 
 6. **Runtime dispatch, not compile-time.** Detect AVX2/NEON at runtime so one binary works everywhere, always using the best available instructions.
 
-7. **Zero-copy across the FFI boundary.** Use Python's buffer protocol to share numpy memory directly with Rust, avoiding per-element marshalling.
+7. **Single bulk copy across the FFI boundary.** Use Python's buffer protocol to read numpy memory in one `memcpy` into Rust-owned storage, avoiding per-element marshalling.
